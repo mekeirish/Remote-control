@@ -1,0 +1,2246 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="theme-color" content="#0a0c11" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Télécommande PC" />
+  <title>Remote control</title>
+
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icon-180.png" />
+  <script src="/vendor/socket.io.min.js"></script>
+  <script>
+    // Secours : si le client local est introuvable (serveur plus ancien), on prend le CDN.
+    if (typeof io === "undefined") {
+      document.write('<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"><\/script>');
+    }
+  </script>
+
+  <style>
+    /* =====================================================================
+       Design : verre dépoli sombre, sans aucune ombre, un seul accent (sky).
+       Jetons inspirés de Tailwind (échelle de 4 px, rayons 12/16/24, slate/sky),
+       précompilés ici pour fonctionner sans Internet.
+       ===================================================================== */
+    :root {
+      color-scheme: dark;
+      --bg: #0a0c11;
+      --glass: rgba(255, 255, 255, 0.055);
+      --glass-2: rgba(255, 255, 255, 0.10);
+      --field: rgba(0, 0, 0, 0.28);
+      --stroke: rgba(255, 255, 255, 0.10);
+      --stroke-2: rgba(255, 255, 255, 0.18);
+      --text: #e9edf5;
+      --muted: #8e97ab;
+      --accent: #38bdf8;
+      --accent-bg: rgba(56, 189, 248, 0.14);
+      --accent-line: rgba(56, 189, 248, 0.42);
+      --accent-text: #bae6fd;
+      --danger-bg: rgba(251, 113, 133, 0.12);
+      --danger-line: rgba(251, 113, 133, 0.38);
+      --danger-text: #fecdd3;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #fb7185;
+      --h: 44px;
+      --r-card: 20px;
+      --r-btn: 14px;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+    [hidden] {
+      display: none !important;
+    }
+    html, body {
+      margin: 0;
+    }
+    body {
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding:
+        calc(env(safe-area-inset-top, 0px) + 10px)
+        calc(env(safe-area-inset-right, 0px) + 12px)
+        calc(env(safe-area-inset-bottom, 0px) + 12px)
+        calc(env(safe-area-inset-left, 0px) + 12px);
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    /* Lueurs d'arrière-plan : dégradés doux, pas d'ombres */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background:
+        radial-gradient(70% 38% at 12% -4%, rgba(56, 189, 248, 0.17), transparent 70%),
+        radial-gradient(55% 34% at 104% 34%, rgba(148, 163, 184, 0.10), transparent 70%),
+        radial-gradient(70% 40% at 28% 106%, rgba(56, 189, 248, 0.09), transparent 70%);
+    }
+
+    /* ---------- Surfaces en verre ---------- */
+    .glass {
+      background: var(--glass);
+      border: 1px solid var(--stroke);
+      border-radius: var(--r-card);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+      backdrop-filter: blur(22px) saturate(150%);
+    }
+
+    /* ---------- Icônes ---------- */
+    .ic {
+      width: 18px;
+      height: 18px;
+      flex: none;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    /* ---------- Boutons : une seule taille, un seul style ---------- */
+    button {
+      font: inherit;
+      color: inherit;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      height: var(--h);
+      min-width: 0;
+      padding: 0 12px;
+      border-radius: var(--r-btn);
+      border: 1px solid var(--stroke);
+      background: var(--glass);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+      transition: background-color 0.12s, border-color 0.12s, color 0.12s, transform 0.12s;
+    }
+    .btn:active {
+      background: var(--glass-2);
+      transform: scale(0.97);
+    }
+    .btn.on {
+      background: var(--accent-bg);
+      border-color: var(--accent-line);
+      color: var(--accent-text);
+    }
+    .btn.danger {
+      background: var(--danger-bg);
+      border-color: var(--danger-line);
+      color: var(--danger-text);
+    }
+    .btn[disabled] {
+      opacity: 0.4;
+      pointer-events: none;
+    }
+    .btn-icon {
+      width: var(--h);
+      padding: 0;
+    }
+    .btn-sq {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      border-radius: 12px;
+    }
+    .btn-wide {
+      width: 100%;
+    }
+
+    /* ---------- Badges ---------- */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: var(--glass);
+      color: var(--muted);
+      font-size: 11.5px;
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .badge .ic {
+      width: 13px;
+      height: 13px;
+    }
+    .badge.accent {
+      background: var(--accent-bg);
+      border-color: var(--accent-line);
+      color: var(--accent-text);
+    }
+    .badge.mini {
+      height: 20px;
+      padding: 0 7px;
+      font-size: 10.5px;
+    }
+    .dot {
+      width: 7px;
+      height: 7px;
+      flex: none;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    [data-state="ok"] > .dot, [data-q="ok"] > .dot, .dot.ok { background: var(--ok); }
+    [data-state="warn"] > .dot, [data-q="warn"] > .dot, .dot.warn { background: var(--warn); }
+    [data-state="bad"] > .dot, [data-q="bad"] > .dot, .dot.bad { background: var(--bad); }
+    .pulse {
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+
+    /* ---------- En-tête ---------- */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 52px;
+      padding: 8px 10px;
+    }
+    .badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+    .tools {
+      display: flex;
+      gap: 6px;
+      flex: none;
+    }
+    .pill {
+      color: var(--text);
+    }
+    @media (max-width: 380px) {
+      .opt-label { display: none; }
+    }
+
+    /* ---------- Aperçu écran ---------- */
+    #screenBox {
+      display: none;
+      overflow: hidden;
+    }
+    #screenBox.active {
+      display: block;
+    }
+    .screen-view {
+      position: relative;
+      background: rgba(0, 0, 0, 0.45);
+    }
+    #screenImg {
+      display: block;
+      width: 100%;
+      max-height: 245px;
+      object-fit: contain;
+      touch-action: manipulation;
+      -webkit-touch-callout: none;
+      user-select: none;
+    }
+    .overlay {
+      position: absolute;
+      left: 8px;
+      top: 8px;
+      display: flex;
+      gap: 6px;
+      pointer-events: none;
+    }
+    .overlay .badge {
+      background: rgba(10, 12, 17, 0.62);
+      -webkit-backdrop-filter: blur(10px);
+      backdrop-filter: blur(10px);
+      color: var(--text);
+    }
+    .screen-controls {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      padding: 8px;
+      border-top: 1px solid var(--stroke);
+    }
+
+    /* ---------- Zone de saisie ---------- */
+    .card {
+      padding: 10px;
+    }
+    .editor-grid {
+      display: grid;
+      grid-template-columns: var(--h) minmax(0, 1fr) var(--h);
+      gap: 8px;
+    }
+    .col {
+      display: grid;
+      grid-template-rows: repeat(3, var(--h));
+      gap: 8px;
+    }
+    .field {
+      position: relative;
+      min-width: 0;
+    }
+    textarea {
+      font-family: inherit;
+      color: var(--text);
+      background: var(--field);
+      border: 1px solid var(--stroke);
+      border-radius: var(--r-btn);
+      outline: none;
+      resize: none;
+      transition: border-color 0.15s;
+    }
+    textarea::placeholder {
+      color: var(--muted);
+    }
+    textarea:focus {
+      border-color: var(--accent-line);
+    }
+    #editor {
+      display: block;
+      width: 100%;
+      height: calc(var(--h) * 3 + 16px);
+      padding: 12px;
+      font-size: 17px;
+      line-height: 1.4;
+      touch-action: manipulation;
+    }
+    #editor.field-ready {
+      border-color: var(--accent-line);
+    }
+    #fieldChip {
+      position: absolute;
+      right: 8px;
+      bottom: 8px;
+      pointer-events: none;
+      background: rgba(10, 12, 17, 0.7);
+      -webkit-backdrop-filter: blur(10px);
+      backdrop-filter: blur(10px);
+    }
+    .row3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .row2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    /* ---------- Pavé tactile + défilement ---------- */
+    .pointer {
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 48px;
+      gap: 8px;
+      min-height: 176px;
+    }
+    .pointer.no-scroll {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    #trackpad {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px;
+      min-width: 0;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      color: var(--muted);
+      background-color: var(--glass);
+      background-image: radial-gradient(rgba(255, 255, 255, 0.09) 1px, transparent 1px);
+      background-size: 18px 18px;
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    #trackpad.dragging {
+      border-color: var(--accent-line);
+      background-color: var(--accent-bg);
+    }
+    #trackpad .ic.big {
+      width: 34px;
+      height: 34px;
+      opacity: 0.35;
+    }
+    .hints {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 6px;
+    }
+    .hints .badge {
+      height: 22px;
+      font-size: 10.5px;
+      font-weight: 500;
+      background: rgba(0, 0, 0, 0.22);
+    }
+    .scroll-col {
+      display: grid;
+      grid-template-rows: var(--h) minmax(0, 1fr) var(--h);
+      gap: 8px;
+    }
+    .scroll-col.hidden {
+      display: none;
+    }
+    .scroll-col .btn {
+      width: 100%;
+      padding: 0;
+    }
+    #scrollBar {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      color: var(--muted);
+      transition: border-color 0.15s, background-color 0.15s;
+    }
+    #scrollBar.scrolling {
+      border-color: var(--accent-line);
+      background-color: var(--accent-bg);
+      color: var(--accent-text);
+    }
+    #scrollBar .track {
+      flex: 1;
+      width: 3px;
+      margin: 8px 0;
+      border-radius: 999px;
+      background: var(--stroke-2);
+    }
+    #scrollBar .ic {
+      width: 14px;
+      height: 14px;
+    }
+
+    /* ---------- Panneau « Plus d'actions » ---------- */
+    #menuBackdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      background: rgba(4, 6, 10, 0.55);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    #menuBackdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #menu {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 41;
+      max-height: 86dvh;
+      display: flex;
+      flex-direction: column;
+      background: rgba(14, 17, 24, 0.80);
+      border-top: 1px solid var(--stroke-2);
+      border-radius: 24px 24px 0 0;
+      -webkit-backdrop-filter: blur(30px) saturate(160%);
+      backdrop-filter: blur(30px) saturate(160%);
+      transform: translateY(105%);
+      transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    #menu.open {
+      transform: none;
+    }
+    .menu-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 14px 8px;
+    }
+    .menu-head .grab {
+      position: absolute;
+      left: 50%;
+      top: 6px;
+      width: 36px;
+      height: 4px;
+      margin-left: -18px;
+      border-radius: 999px;
+      background: var(--stroke-2);
+    }
+    .menu-title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .menu-body {
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 0 14px 18px;
+    }
+    .sec-title {
+      margin: 16px 2px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .g2, .g3, .g4, .g6 {
+      display: grid;
+      gap: 8px;
+    }
+    .g2 { grid-template-columns: repeat(2, 1fr); }
+    .g3 { grid-template-columns: repeat(3, 1fr); }
+    .g4 { grid-template-columns: repeat(4, 1fr); }
+    .g6 { grid-template-columns: repeat(6, 1fr); }
+    .g4 .btn, .g6 .btn {
+      padding: 0 4px;
+      font-size: 12.5px;
+    }
+    #clipText {
+      display: block;
+      width: 100%;
+      height: 76px;
+      margin-bottom: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+    .info {
+      min-height: 16px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .opt {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 52px;
+      padding: 6px 2px;
+      border-bottom: 1px solid var(--stroke);
+    }
+    .opt:last-of-type {
+      border-bottom: 0;
+    }
+    .opt .t {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .opt .d {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .switch {
+      flex: none;
+      display: block;
+      width: 46px;
+      height: 28px;
+    }
+    .switch input {
+      position: relative;
+      display: block;
+      width: 46px;
+      height: 28px;
+      margin: 0;
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: var(--glass-2);
+      -webkit-appearance: none;
+      appearance: none;
+      cursor: pointer;
+      transition: background-color 0.18s, border-color 0.18s;
+    }
+    .switch input::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #cbd5e1;
+      transition: transform 0.18s, background-color 0.18s;
+    }
+    .switch input:checked {
+      background: var(--accent-bg);
+      border-color: var(--accent-line);
+    }
+    .switch input:checked::after {
+      transform: translateX(18px);
+      background: var(--accent);
+    }
+    .seg {
+      display: flex;
+      gap: 3px;
+      padding: 3px;
+      border-radius: 12px;
+      border: 1px solid var(--stroke);
+      background: var(--field);
+    }
+    .seg button {
+      flex: 1;
+      height: 32px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .seg button.on {
+      background: var(--accent-bg);
+      color: var(--accent-text);
+    }
+
+    /* ---------- Saisie du PIN ---------- */
+    #pinGate {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: var(--bg);
+    }
+    #pinGate::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(70% 38% at 12% -4%, rgba(56, 189, 248, 0.17), transparent 70%),
+        radial-gradient(70% 40% at 28% 106%, rgba(56, 189, 248, 0.09), transparent 70%);
+    }
+    #pinGate.open {
+      display: flex;
+    }
+    .pin-card {
+      position: relative;
+      width: min(340px, 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 24px 20px;
+      text-align: center;
+    }
+    .pin-card .badge {
+      width: 52px;
+      height: 52px;
+      padding: 0;
+      justify-content: center;
+      border-radius: 16px;
+      color: var(--accent-text);
+      background: var(--accent-bg);
+      border-color: var(--accent-line);
+    }
+    .pin-card .badge .ic {
+      width: 24px;
+      height: 24px;
+    }
+    #pinInput {
+      width: 100%;
+      height: 56px;
+      border-radius: var(--r-btn);
+      border: 1px solid var(--stroke);
+      background: var(--field);
+      color: var(--text);
+      font-size: 26px;
+      letter-spacing: 0.3em;
+      text-align: center;
+      outline: none;
+    }
+    #pinInput:focus {
+      border-color: var(--accent-line);
+    }
+    #pinError {
+      min-height: 18px;
+      color: var(--bad);
+      font-size: 13px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        transition: none !important;
+        animation: none !important;
+      }
+    }
+  </style>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<meta property="og:title" content="Remote control">
+<meta name="twitter:title" content="Remote control">
+<meta name="application-name" content="Remote control">
+<meta name="description" content="Télécommande PC">
+<meta property="og:description" content="Télécommande PC">
+<meta name="twitter:description" content="Télécommande PC">
+<meta property="og:image" content="https://mekeirish.github.io/Remote-control/icon.png">
+<meta name="twitter:image" content="https://mekeirish.github.io/Remote-control/icon.png">
+<meta name="twitter:card" content="summary">
+<meta property="og:url" content="https://mekeirish.github.io/Remote-control/">
+<link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1320x2868.png">
+<link rel="apple-touch-startup-image" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1206x2622.png">
+<link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1290x2796.png">
+<link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1179x2556.png">
+<link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1284x2778.png">
+<link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1170x2532.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1242x2688.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="./splash-828x1792.png">
+<link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1125x2436.png">
+<link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="./splash-1242x2208.png">
+<link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="./splash-750x1334.png">
+<link rel="apple-touch-startup-image" media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="./splash-640x1136.png">
+</head>
+<body>
+  <!-- Icônes (SVG inline, même trait partout) -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+      <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></symbol>
+      <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+      <symbol id="i-zin" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M11 8v6M8 11h6"/></symbol>
+      <symbol id="i-zout" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3M8 11h6"/></symbol>
+      <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+      <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></symbol>
+      <symbol id="i-mouse" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/></symbol>
+      <symbol id="i-mouse-r" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 2v8h7"/></symbol>
+      <symbol id="i-up2" viewBox="0 0 24 24"><path d="m17 11-5-5-5 5"/><path d="m17 18-5-5-5 5"/></symbol>
+      <symbol id="i-down2" viewBox="0 0 24 24"><path d="m7 6 5 5 5-5"/><path d="m7 13 5 5 5-5"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+      <symbol id="i-paste" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></symbol>
+      <symbol id="i-scan" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="8" y="8" width="8" height="8" rx="1"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></symbol>
+      <symbol id="i-esc" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></symbol>
+      <symbol id="i-tab" viewBox="0 0 24 24"><path d="M17 12H3"/><path d="m11 18 6-6-6-6"/><path d="M21 5v14"/></symbol>
+      <symbol id="i-bksp" viewBox="0 0 24 24"><path d="M10 5a2 2 0 0 0-1.3.5l-6.4 5.7a1 1 0 0 0 0 1.5l6.4 5.8A2 2 0 0 0 10 19h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z"/><path d="m12 9 6 6M18 9l-6 6"/></symbol>
+      <symbol id="i-clear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6M9 9l6 6"/></symbol>
+      <symbol id="i-vibrate" viewBox="0 0 24 24"><rect x="8" y="4" width="8" height="16" rx="1.5"/><path d="m4 8-2 4 2 4M20 8l2 4-2 4"/></symbol>
+      <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><path d="M12 20h.01"/></symbol>
+      <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.7-9h1.8a4.5 4.5 0 1 1 0 9z"/></symbol>
+      <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 15h8"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+      <symbol id="i-dl" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></symbol>
+      <symbol id="i-ul" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></symbol>
+      <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/></symbol>
+      <symbol id="i-vdown" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></symbol>
+      <symbol id="i-vup" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></symbol>
+      <symbol id="i-vmute" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="m22 9-6 6M16 9l6 6"/></symbol>
+      <symbol id="i-prev" viewBox="0 0 24 24"><path d="M19 20 9 12l10-8z"/><path d="M5 19V5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m6 3 14 9-14 9z"/></symbol>
+      <symbol id="i-next" viewBox="0 0 24 24"><path d="m5 4 10 8-10 8z"/><path d="M19 5v14"/></symbol>
+      <symbol id="i-install" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 7v7M9 11l3 3 3-3M11 18h2"/></symbol>
+    </defs>
+  </svg>
+
+  <!-- En-tête : état + badges + outils -->
+  <header class="glass header">
+    <div class="badges">
+      <div class="badge pill" id="statusPill" data-state="warn">
+        <span class="dot"></span><span id="statusText">Connexion…</span>
+      </div>
+      <div class="badge" id="linkBadge" title="Type de liaison">
+        <svg class="ic"><use id="linkIcon" href="#i-wifi"/></svg><span class="opt-label" id="linkText">Local</span>
+      </div>
+      <div class="badge" id="pingBadge" data-q="" hidden title="Latence vers le PC">
+        <span class="dot"></span><span id="pingText">—</span>
+      </div>
+    </div>
+    <div class="tools">
+      <button class="btn btn-sq" id="hapticBtn" type="button" data-haptic="none" title="Retour haptique" aria-label="Retour haptique">
+        <svg class="ic"><use href="#i-vibrate"/></svg>
+      </button>
+      <button class="btn btn-sq" id="menuBtn" type="button" title="Plus d'actions" aria-label="Plus d'actions">
+        <svg class="ic"><use href="#i-menu"/></svg>
+      </button>
+      <button class="btn btn-sq danger" id="stopBtn" type="button" title="Arrêter le serveur PC" aria-label="Arrêter le serveur PC">
+        <svg class="ic"><use href="#i-power"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Aperçu écran -->
+  <section class="glass" id="screenBox">
+    <div class="screen-view">
+      <img id="screenImg" alt="Aperçu écran PC" title="Touche pour cliquer · appui long = clic droit" />
+      <div class="overlay">
+        <span class="badge mini"><span class="dot ok pulse"></span>LIVE</span>
+        <span class="badge mini" id="zoomLabel">1.0×</span>
+      </div>
+    </div>
+    <div class="screen-controls">
+      <button class="btn" id="zoomOutBtn" type="button" title="Dézoomer"><svg class="ic"><use href="#i-zout"/></svg></button>
+      <button class="btn" id="zoomInBtn" type="button" title="Zoomer"><svg class="ic"><use href="#i-zin"/></svg></button>
+      <button class="btn on" id="followBtn" type="button" data-haptic="medium" title="Suivre la souris"><svg class="ic"><use href="#i-target"/></svg>Suivi</button>
+    </div>
+  </section>
+
+  <!-- Saisie -->
+  <section class="glass card">
+    <div class="editor-grid">
+      <div class="col">
+        <button class="btn btn-icon" id="escBtn" type="button" title="Échap (Esc)" aria-label="Échap"><svg class="ic"><use href="#i-esc"/></svg></button>
+        <button class="btn btn-icon" id="tabBtn" type="button" title="Tabulation (Tab)" aria-label="Tabulation"><svg class="ic"><use href="#i-tab"/></svg></button>
+        <button class="btn btn-icon" id="prtscBtn" type="button" title="Capture d'écran PC (PrtSc)" aria-label="Capture d'écran"><svg class="ic"><use href="#i-camera"/></svg></button>
+      </div>
+
+      <div class="field">
+        <textarea
+          id="editor"
+          autocapitalize="sentences"
+          autocomplete="on"
+          autocorrect="on"
+          spellcheck="true"
+          placeholder="Touchez ici pour écrire ou dicter…"
+        ></textarea>
+        <span class="badge accent mini" id="fieldChip" hidden>
+          <svg class="ic"><use href="#i-keyboard"/></svg><span id="fieldChipText">Texte</span>
+        </span>
+      </div>
+
+      <div class="col">
+        <button class="btn btn-icon" id="selectAllBtn" type="button" title="Sélectionner tout" aria-label="Sélectionner tout"><svg class="ic"><use href="#i-scan"/></svg></button>
+        <button class="btn btn-icon" id="copyBtn" type="button" title="Copier" aria-label="Copier"><svg class="ic"><use href="#i-copy"/></svg></button>
+        <button class="btn btn-icon" id="pasteBtn" type="button" title="Coller" aria-label="Coller"><svg class="ic"><use href="#i-paste"/></svg></button>
+      </div>
+    </div>
+
+    <div class="row3" style="margin-top: 8px;">
+      <button class="btn" id="backspaceBtn" type="button" title="Effacer un caractère sur le PC (maintenir = répéter)"><svg class="ic"><use href="#i-bksp"/></svg>Effacer</button>
+      <button class="btn" id="clearBtn" type="button" title="Vider le champ du téléphone"><svg class="ic"><use href="#i-clear"/></svg>Vider</button>
+      <button class="btn" id="screenToggleBtn" type="button" data-haptic="medium" title="Aperçu de l'écran du PC"><svg class="ic"><use href="#i-monitor"/></svg>Écran<span class="dot" id="screenDot"></span></button>
+    </div>
+  </section>
+
+  <!-- Pavé tactile + défilement -->
+  <section class="pointer" id="pointerArea">
+    <div class="glass" id="trackpad">
+      <svg class="ic big"><use href="#i-mouse"/></svg>
+      <div class="hints" id="tpHints">
+        <span class="badge">1 doigt · déplacer</span>
+        <span class="badge">Tap · clic</span>
+        <span class="badge">2 doigts · défiler</span>
+        <span class="badge">Tap 2 doigts · clic droit</span>
+      </div>
+      <span class="badge accent" id="tpHold" hidden><span class="dot pulse" style="background: var(--accent)"></span>Clic maintenu · glisse pour déplacer</span>
+    </div>
+
+    <div class="scroll-col" id="scrollColumn">
+      <button class="btn" id="scrollTopBtn" type="button" title="Tout en haut" aria-label="Tout en haut"><svg class="ic"><use href="#i-up2"/></svg></button>
+      <div class="glass" id="scrollBar" title="Glisser verticalement pour défiler" style="border-radius: var(--r-btn)">
+        <svg class="ic"><use href="#i-up2"/></svg>
+        <div class="track"></div>
+        <svg class="ic"><use href="#i-down2"/></svg>
+      </div>
+      <button class="btn" id="scrollBottomBtn" type="button" title="Tout en bas" aria-label="Tout en bas"><svg class="ic"><use href="#i-down2"/></svg></button>
+    </div>
+  </section>
+
+  <div class="row2">
+    <button class="btn" id="leftHoldBtn" type="button" data-haptic="medium" title="Maintenir le clic gauche (glisser-déposer)">
+      <svg class="ic"><use id="leftHoldIcon" href="#i-lock"/></svg><span id="leftHoldLabel">Maintenir</span>
+    </button>
+    <button class="btn" id="rightClickBtn" type="button" title="Clic droit"><svg class="ic"><use href="#i-mouse-r"/></svg>Clic droit</button>
+  </div>
+
+  <!-- Panneau « Plus d'actions » (masqué par défaut) -->
+  <div id="menuBackdrop"></div>
+  <div id="menu" role="dialog" aria-label="Plus d'actions">
+    <div class="menu-head" style="position: relative;">
+      <span class="grab"></span>
+      <span class="menu-title">Plus d'actions</span>
+      <button class="btn btn-sq" id="menuClose" type="button" aria-label="Fermer"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="menu-body">
+      <div class="sec-title">Touches</div>
+      <div class="g4">
+        <button class="btn" type="button" data-key="enter" title="Entrée">Entrée</button>
+        <button class="btn" type="button" data-key="up" data-repeat="1" title="Haut">↑</button>
+        <button class="btn" type="button" data-key="delete" data-repeat="1" title="Supprimer">Suppr</button>
+        <button class="btn" type="button" data-key="home" title="Début de ligne">Début</button>
+        <button class="btn" type="button" data-key="left" data-repeat="1" title="Gauche">←</button>
+        <button class="btn" type="button" data-key="down" data-repeat="1" title="Bas">↓</button>
+        <button class="btn" type="button" data-key="right" data-repeat="1" title="Droite">→</button>
+        <button class="btn" type="button" data-key="end" title="Fin de ligne">Fin</button>
+        <button class="btn" type="button" data-key="page_up" data-repeat="1" title="Page précédente">Page ↑</button>
+        <button class="btn" type="button" data-key="page_down" data-repeat="1" title="Page suivante">Page ↓</button>
+        <button class="btn" type="button" data-key="f5" title="Actualiser (F5)">F5</button>
+        <button class="btn" type="button" data-key="space" data-repeat="1" title="Espace">Espace</button>
+      </div>
+
+      <div class="sec-title">Raccourcis</div>
+      <div class="g4">
+        <button class="btn" type="button" data-combo="undo" title="Annuler (Ctrl+Z)">Annuler</button>
+        <button class="btn" type="button" data-combo="redo" title="Rétablir (Ctrl+Y)">Rétablir</button>
+        <button class="btn" type="button" data-combo="cut" title="Couper (Ctrl+X)">Couper</button>
+        <button class="btn" type="button" data-combo="close_tab" title="Fermer l'onglet (Ctrl+W)">Fermer</button>
+        <button class="btn" type="button" data-combo="alt_tab" title="Changer de fenêtre (Alt+Tab)">Alt+Tab</button>
+        <button class="btn" type="button" data-combo="desktop" title="Afficher le bureau (Win+D)">Bureau</button>
+        <button class="btn" type="button" data-combo="start" title="Touche Windows">Windows</button>
+        <button class="btn" type="button" data-combo="new_tab" title="Nouvel onglet (Ctrl+T)">+ Onglet</button>
+        <button class="btn" type="button" data-combo="find" title="Rechercher (Ctrl+F)">Chercher</button>
+        <button class="btn" type="button" data-combo="save" title="Enregistrer (Ctrl+S)">Enreg.</button>
+      </div>
+
+      <div class="sec-title">Médias</div>
+      <div class="g6">
+        <button class="btn" type="button" data-media="vol_down" title="Volume -" aria-label="Volume moins"><svg class="ic"><use href="#i-vdown"/></svg></button>
+        <button class="btn" type="button" data-media="vol_up" title="Volume +" aria-label="Volume plus"><svg class="ic"><use href="#i-vup"/></svg></button>
+        <button class="btn" type="button" data-media="mute" title="Muet" aria-label="Muet"><svg class="ic"><use href="#i-vmute"/></svg></button>
+        <button class="btn" type="button" data-media="prev" title="Précédent" aria-label="Précédent"><svg class="ic"><use href="#i-prev"/></svg></button>
+        <button class="btn" type="button" data-media="play_pause" title="Lecture / Pause" aria-label="Lecture ou pause"><svg class="ic"><use href="#i-play"/></svg></button>
+        <button class="btn" type="button" data-media="next" title="Suivant" aria-label="Suivant"><svg class="ic"><use href="#i-next"/></svg></button>
+      </div>
+
+      <div class="sec-title">Presse-papier</div>
+      <textarea id="clipText" placeholder="Texte à envoyer au PC, ou texte reçu du PC"></textarea>
+      <div class="g2">
+        <button class="btn" type="button" id="clipGetBtn"><svg class="ic"><use href="#i-dl"/></svg>Du PC</button>
+        <button class="btn" type="button" id="clipPhoneBtn"><svg class="ic"><use href="#i-copy"/></svg>Copier ici</button>
+        <button class="btn" type="button" id="clipSendBtn"><svg class="ic"><use href="#i-ul"/></svg>Vers le PC</button>
+        <button class="btn" type="button" id="clipPasteBtn"><svg class="ic"><use href="#i-paste"/></svg>Envoyer + coller</button>
+      </div>
+      <div class="info" id="clipInfo"></div>
+
+      <div id="installBox">
+        <div class="sec-title">Application</div>
+        <button class="btn on btn-wide" type="button" id="installBtn" style="display: none;"><svg class="ic"><use href="#i-install"/></svg>Installer l'application</button>
+        <div class="info" id="installInfo"></div>
+      </div>
+
+      <div class="sec-title">Options</div>
+      <div class="opt">
+        <div><div class="t">Retour haptique</div><div class="d" id="hapticNote">Vibration légère à chaque appui</div></div>
+        <label class="switch"><input type="checkbox" id="optHaptic" data-haptic="none" /></label>
+      </div>
+      <div class="opt">
+        <div class="t">Intensité</div>
+        <div class="seg" id="hapticSeg">
+          <button type="button" data-level="1" data-haptic="none">Douce</button>
+          <button type="button" data-level="2" data-haptic="none">Normale</button>
+          <button type="button" data-level="3" data-haptic="none">Forte</button>
+        </div>
+      </div>
+      <div class="opt">
+        <div><div class="t">Clavier automatique</div><div class="d">S'ouvre quand un champ est cliqué sur le PC</div></div>
+        <label class="switch"><input type="checkbox" id="optAutoKb" /></label>
+      </div>
+      <div class="opt">
+        <div><div class="t">Pré-remplir le champ</div><div class="d">Reprend le texte existant pour le corriger</div></div>
+        <label class="switch"><input type="checkbox" id="optPrefill" /></label>
+      </div>
+      <div class="opt">
+        <div class="t">Barre de défilement</div>
+        <label class="switch"><input type="checkbox" id="optScroll" /></label>
+      </div>
+      <div class="opt">
+        <div class="t">Accélération de la souris</div>
+        <label class="switch"><input type="checkbox" id="optAccel" /></label>
+      </div>
+      <div class="opt">
+        <div class="t">Garder l'écran allumé</div>
+        <label class="switch"><input type="checkbox" id="optWake" /></label>
+      </div>
+      <button class="btn btn-wide" type="button" id="changePinBtn" style="margin-top: 12px;"><svg class="ic"><use href="#i-key"/></svg>Changer de PIN</button>
+    </div>
+  </div>
+
+  <!-- Saisie du PIN -->
+  <div id="pinGate">
+    <div class="glass pin-card">
+      <span class="badge"><svg class="ic"><use href="#i-lock"/></svg></span>
+      <div style="font-size: 18px; font-weight: 700;">Télécommande PC</div>
+      <div style="color: var(--muted); font-size: 13px;">Saisis le code PIN affiché sur le PC</div>
+      <input id="pinInput" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="off" />
+      <div id="pinError"></div>
+      <button class="btn on btn-wide" id="pinBtn" type="button">Se connecter</button>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    /* ---------- PIN ---------- */
+    let currentPin = "";
+    try { currentPin = localStorage.getItem("rc_pin") || ""; } catch (e) {}
+
+    const hashMatch = location.hash.match(/pin=(\d{4,12})/);
+    if (hashMatch) {
+      currentPin = hashMatch[1];
+      try { localStorage.setItem("rc_pin", currentPin); } catch (e) {}
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    }
+
+    const socket = io({ autoConnect: false, auth: (cb) => cb({ pin: currentPin }) });
+
+    const statusPill = $("statusPill");
+    const statusText = $("statusText");
+    const pingBadge = $("pingBadge");
+    const pingText = $("pingText");
+    const editor = $("editor");
+    const fieldChip = $("fieldChip");
+    const fieldChipText = $("fieldChipText");
+    const trackpad = $("trackpad");
+    const tpHints = $("tpHints");
+    const tpHold = $("tpHold");
+    const pointerArea = $("pointerArea");
+    const scrollBar = $("scrollBar");
+    const scrollColumn = $("scrollColumn");
+    const screenBox = $("screenBox");
+    const screenImg = $("screenImg");
+    const screenToggleBtn = $("screenToggleBtn");
+    const screenDot = $("screenDot");
+    const zoomInBtn = $("zoomInBtn");
+    const zoomOutBtn = $("zoomOutBtn");
+    const zoomLabel = $("zoomLabel");
+    const followBtn = $("followBtn");
+    const leftHoldBtn = $("leftHoldBtn");
+    const pinGate = $("pinGate");
+    const pinInput = $("pinInput");
+    const pinError = $("pinError");
+    const hapticBtn = $("hapticBtn");
+
+    function setStatus(state, text) {
+      statusPill.dataset.state = state;
+      statusText.textContent = text;
+    }
+
+    function showPinGate(message) {
+      pinError.textContent = message || "";
+      pinInput.value = "";
+      pinGate.classList.add("open");
+      setTimeout(() => pinInput.focus(), 50);
+    }
+
+    function hidePinGate() {
+      pinGate.classList.remove("open");
+      pinInput.blur();
+    }
+
+    function connectWithPin() {
+      if (!currentPin) {
+        showPinGate("");
+        return;
+      }
+      socket.connect();
+    }
+
+    function submitPin() {
+      const v = pinInput.value.trim();
+      if (!/^\d{4,12}$/.test(v)) {
+        pinError.textContent = "Le PIN contient 4 à 12 chiffres";
+        haptic("error");
+        return;
+      }
+      currentPin = v;
+      try { localStorage.setItem("rc_pin", v); } catch (e) {}
+      hidePinGate();
+      setStatus("warn", "Connexion…");
+      socket.connect();
+    }
+
+    $("pinBtn").addEventListener("click", submitPin);
+    pinInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitPin();
+    });
+
+    socket.on("connect_error", (err) => {
+      const m = (err && err.message) || "";
+      if (m === "unauthorized") {
+        currentPin = "";
+        try { localStorage.removeItem("rc_pin"); } catch (e) {}
+        setStatus("bad", "Non autorisé");
+        showPinGate("PIN incorrect");
+        haptic("error");
+      } else if (m === "blocked") {
+        currentPin = "";
+        try { localStorage.removeItem("rc_pin"); } catch (e) {}
+        setStatus("bad", "Bloqué");
+        showPinGate("Trop d'essais. Réessaie plus tard.");
+        haptic("error");
+      }
+    });
+
+    /* ---------- Réglages (mémorisés sur le téléphone) ---------- */
+    const settings = {
+      autoKb: true,
+      prefill: true,
+      showScroll: true,
+      accel: true,
+      wake: true,
+      haptic: true,
+      hapticLevel: 2
+    };
+    try {
+      Object.assign(settings, JSON.parse(localStorage.getItem("rc_settings") || "{}"));
+    } catch (e) {}
+
+    function saveSettings() {
+      try { localStorage.setItem("rc_settings", JSON.stringify(settings)); } catch (e) {}
+    }
+
+    /* ---------- Retour haptique ---------- */
+    const canVibrate = typeof navigator.vibrate === "function";
+    const HAPTIC = {
+      light: [6, 10, 14],
+      medium: [12, 18, 26],
+      heavy: [22, 32, 46],
+      error: [[30, 40, 30], [40, 50, 40], [50, 60, 50]]
+    };
+
+    function haptic(kind) {
+      if (!settings.haptic || !canVibrate) return;
+      const level = Math.min(2, Math.max(0, (Number(settings.hapticLevel) || 2) - 1));
+      const pattern = (HAPTIC[kind] || HAPTIC.light)[level];
+      try { navigator.vibrate(pattern); } catch (e) {}
+    }
+
+    document.addEventListener("click", (e) => {
+      const b = e.target.closest && e.target.closest("button");
+      if (!b || b.disabled) return;
+      const kind = b.dataset.haptic;
+      if (kind === "none") return;
+      haptic(kind || "light");
+    }, true);
+
+    /* ---------- Variables d'état ---------- */
+    let syncedValue = "";
+    let syncTimer = null;
+    let isComposing = false;
+    let screenEnabled = false;
+    let leftHoldActive = false;
+
+    const zoomLevels = [1.0, 1.5, 2.0, 3.0];
+    let zoomIndex = 0;
+    let followMouse = true;
+
+    const sensitivity = 1.6;
+    let startTime = 0;
+    let movedDistance = 0;
+    let tpMaxTouches = 0;
+    let tpMulti = false;
+    let tpCx = 0;
+    let tpCy = 0;
+    let mvX = 0;
+    let mvY = 0;
+    let twoRemX = 0;
+    let twoRemY = 0;
+
+    let scrollLastY = null;
+    let scrollRemainder = 0;
+    const scrollSensitivity = 0.14;
+
+    let frameUrl = null;
+    let screenCrop = [0, 0, 1, 1];
+
+    /* ---------- Liaison + latence ---------- */
+    const lanRe = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)|\.local$/;
+    const isLan = lanRe.test(location.hostname);
+    $("linkIcon").setAttribute("href", isLan ? "#i-wifi" : "#i-cloud");
+    $("linkText").textContent = isLan ? "Local" : "Distant";
+    $("linkBadge").classList.toggle("accent", !isLan);
+
+    function measurePing() {
+      if (!socket.connected) {
+        pingBadge.hidden = true;
+        return;
+      }
+      pingBadge.hidden = false;
+      const t0 = performance.now();
+      socket.timeout(2500).emit("ping_check", (err) => {
+        if (err) {
+          pingText.textContent = "—";
+          pingBadge.dataset.q = "";
+          return;
+        }
+        const ms = Math.round(performance.now() - t0);
+        pingText.textContent = ms + " ms";
+        pingBadge.dataset.q = ms < 120 ? "ok" : ms < 300 ? "warn" : "bad";
+      });
+    }
+    setInterval(measurePing, 4000);
+
+    /* ---------- Écran toujours allumé ---------- */
+    let wakeSentinel = null;
+    let wakeVideo = null;
+    let wakeTimer = null;
+
+    function startWakeVideoFallback() {
+      try {
+        if (!wakeVideo) {
+          const c = document.createElement("canvas");
+          c.width = 16;
+          c.height = 16;
+          if (!c.captureStream) return;
+          const ctx = c.getContext("2d");
+          wakeVideo = document.createElement("video");
+          wakeVideo.setAttribute("playsinline", "");
+          wakeVideo.muted = true;
+          wakeVideo.loop = true;
+          wakeVideo.style.cssText =
+            "position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;";
+          wakeVideo.srcObject = c.captureStream(2);
+          document.body.appendChild(wakeVideo);
+          let t = 0;
+          wakeTimer = setInterval(() => {
+            ctx.fillStyle = (t++ % 2) ? "#000000" : "#010101";
+            ctx.fillRect(0, 0, 16, 16);
+          }, 500);
+        }
+        const p = wakeVideo.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) {}
+    }
+
+    async function requestWake() {
+      if (!settings.wake) return;
+      try {
+        if ("wakeLock" in navigator) {
+          wakeSentinel = await navigator.wakeLock.request("screen");
+          wakeSentinel.addEventListener("release", () => { wakeSentinel = null; });
+          return;
+        }
+      } catch (e) {}
+      startWakeVideoFallback();
+    }
+
+    function releaseWake() {
+      try { if (wakeSentinel) wakeSentinel.release(); } catch (e) {}
+      wakeSentinel = null;
+      if (wakeVideo) {
+        try { wakeVideo.pause(); } catch (e) {}
+      }
+    }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") requestWake();
+    });
+    document.addEventListener("pointerdown", () => requestWake(), { once: true });
+
+    /* ---------- Clavier du téléphone ---------- */
+    const defaultPlaceholder = editor.placeholder;
+    const inputModes = { text: "text", number: "numeric", decimal: "decimal", tel: "tel" };
+    const kindLabels = { text: "Texte", number: "Nombre", decimal: "Décimal", tel: "Téléphone" };
+    let autoOpened = false;
+
+    function focusEditorForKeyboard() {
+      if (document.activeElement !== editor) {
+        editor.focus({ preventScroll: false });
+      }
+      editor.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    editor.addEventListener("click", () => {
+      focusEditorForKeyboard();
+    });
+
+    editor.addEventListener("touchend", () => {
+      focusEditorForKeyboard();
+    }, { passive: true });
+
+    function resetFieldUI() {
+      editor.classList.remove("field-ready");
+      editor.placeholder = defaultPlaceholder;
+      fieldChip.hidden = true;
+    }
+
+    function resetMirror() {
+      if (syncTimer) clearTimeout(syncTimer);
+      editor.value = "";
+      syncedValue = "";
+    }
+
+    socket.on("input_focus", (data) => {
+      if (!settings.autoKb) return;
+
+      if (data && data.active) {
+        if (syncTimer) clearTimeout(syncTimer);
+        const v = typeof data.value === "string" ? data.value : "";
+        editor.value = v;
+        syncedValue = v;
+
+        const mode = inputModes[data.kind] || "text";
+        if (editor.inputMode !== mode) {
+          editor.blur();
+          editor.inputMode = mode;
+        }
+
+        editor.classList.add("field-ready");
+        fieldChipText.textContent = (kindLabels[data.kind] || "Texte") + (v ? " · pré-rempli" : "");
+        fieldChip.hidden = false;
+
+        editor.focus();
+        try { editor.setSelectionRange(v.length, v.length); } catch (e) {}
+        autoOpened = true;
+      } else {
+        resetFieldUI();
+        if (autoOpened) {
+          editor.blur();
+          autoOpened = false;
+        }
+      }
+    });
+
+    /* ---------- Souris : maintien du clic ---------- */
+    function setLeftHoldUI(held) {
+      leftHoldActive = held;
+      leftHoldBtn.classList.toggle("on", held);
+      $("leftHoldLabel").textContent = held ? "Relâcher" : "Maintenir";
+      $("leftHoldIcon").setAttribute("href", held ? "#i-unlock" : "#i-lock");
+      trackpad.classList.toggle("dragging", held);
+      tpHold.hidden = !held;
+      tpHints.hidden = held;
+    }
+
+    /* ---------- Aperçu écran ---------- */
+    function updateScreenViewUI() {
+      const z = zoomLevels[zoomIndex];
+      zoomLabel.textContent = z.toFixed(1) + "×";
+      followBtn.classList.toggle("on", followMouse);
+      socket.emit("set_screen_view", {
+        zoom: z,
+        follow_mouse: followMouse
+      });
+    }
+
+    socket.on("connect", () => {
+      hidePinGate();
+      setStatus("ok", "Connecté");
+      socket.emit("set_prefill", { enabled: settings.prefill });
+      if (screenEnabled) {
+        socket.emit("set_screen_stream", { enabled: true });
+        updateScreenViewUI();
+      }
+      measurePing();
+    });
+
+    socket.on("disconnect", () => {
+      setStatus("bad", "Déconnecté");
+      pingBadge.hidden = true;
+      if (leftHoldActive) {
+        setLeftHoldUI(false);
+      }
+    });
+
+    socket.on("screen_frame", (data) => {
+      if (!screenEnabled || !data || !data.image) return;
+      const url = URL.createObjectURL(new Blob([data.image], { type: "image/jpeg" }));
+      const prev = frameUrl;
+      frameUrl = url;
+      if (Array.isArray(data.crop) && data.crop.length === 4) screenCrop = data.crop;
+      const done = () => {
+        if (prev) URL.revokeObjectURL(prev);
+        socket.emit("screen_ack");
+      };
+      screenImg.onload = done;
+      screenImg.onerror = done;
+      screenImg.src = url;
+    });
+
+    screenToggleBtn.addEventListener("click", () => {
+      screenEnabled = !screenEnabled;
+      screenToggleBtn.classList.toggle("on", screenEnabled);
+      screenDot.className = screenEnabled ? "dot ok pulse" : "dot";
+      screenBox.classList.toggle("active", screenEnabled);
+      if (!screenEnabled) {
+        screenImg.removeAttribute("src");
+        if (frameUrl) {
+          URL.revokeObjectURL(frameUrl);
+          frameUrl = null;
+        }
+      } else {
+        updateScreenViewUI();
+      }
+      socket.emit("set_screen_stream", { enabled: screenEnabled });
+    });
+
+    zoomInBtn.addEventListener("click", () => {
+      if (zoomIndex < zoomLevels.length - 1) {
+        zoomIndex++;
+        updateScreenViewUI();
+      }
+    });
+
+    zoomOutBtn.addEventListener("click", () => {
+      if (zoomIndex > 0) {
+        zoomIndex--;
+        updateScreenViewUI();
+      }
+    });
+
+    followBtn.addEventListener("click", () => {
+      followMouse = !followMouse;
+      updateScreenViewUI();
+    });
+
+    /* Toucher l'aperçu : clic à cet endroit ; appui long : clic droit */
+    function screenPoint(clientX, clientY) {
+      const r = screenImg.getBoundingClientRect();
+      const nw = screenImg.naturalWidth;
+      const nh = screenImg.naturalHeight;
+      if (!nw || !nh || !r.width || !r.height) return null;
+      const scale = Math.min(r.width / nw, r.height / nh);
+      const dw = nw * scale;
+      const dh = nh * scale;
+      const ox = r.left + (r.width - dw) / 2;
+      const oy = r.top + (r.height - dh) / 2;
+      const u = (clientX - ox) / dw;
+      const v = (clientY - oy) / dh;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+      return {
+        x: screenCrop[0] + u * (screenCrop[2] - screenCrop[0]),
+        y: screenCrop[1] + v * (screenCrop[3] - screenCrop[1])
+      };
+    }
+
+    function clickOnScreen(clientX, clientY, button) {
+      const p = screenPoint(clientX, clientY);
+      if (!p) return;
+      socket.emit("mouse_click_at", { x: p.x, y: p.y, button: button });
+    }
+
+    let lpTimer = null;
+    let lpFired = false;
+    let lpStartX = 0;
+    let lpStartY = 0;
+
+    screenImg.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      lpFired = false;
+      lpStartX = t.clientX;
+      lpStartY = t.clientY;
+      clearTimeout(lpTimer);
+      lpTimer = setTimeout(() => {
+        lpFired = true;
+        haptic("heavy");
+        clickOnScreen(lpStartX, lpStartY, "right");
+      }, 550);
+    }, { passive: true });
+
+    screenImg.addEventListener("touchmove", (e) => {
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX - lpStartX, t.clientY - lpStartY) > 10) {
+        clearTimeout(lpTimer);
+      }
+    }, { passive: true });
+
+    screenImg.addEventListener("touchend", () => clearTimeout(lpTimer), { passive: true });
+    screenImg.addEventListener("touchcancel", () => clearTimeout(lpTimer), { passive: true });
+
+    screenImg.addEventListener("click", (e) => {
+      if (lpFired) {
+        lpFired = false;
+        return;
+      }
+      haptic("medium");
+      clickOnScreen(e.clientX, e.clientY, "left");
+    });
+
+    screenImg.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    /* ---------- Synchronisation du texte ---------- */
+    function computeDiff(oldStr, newStr) {
+      let prefixLen = 0;
+      const minLen = Math.min(oldStr.length, newStr.length);
+      while (prefixLen < minLen && oldStr[prefixLen] === newStr[prefixLen]) {
+        prefixLen++;
+      }
+
+      let suffixLen = 0;
+      while (
+        suffixLen < (minLen - prefixLen) &&
+        oldStr[oldStr.length - 1 - suffixLen] === newStr[newStr.length - 1 - suffixLen]
+      ) {
+        suffixLen++;
+      }
+
+      const deleteCount = oldStr.length - prefixLen - suffixLen;
+      const insertText = newStr.slice(prefixLen, newStr.length - suffixLen);
+      const moveAfter = suffixLen;
+      return { deleteCount, insertText, moveAfter };
+    }
+
+    function flushTextSync() {
+      if (isComposing) return;
+      const currentValue = editor.value;
+      if (currentValue === syncedValue) return;
+
+      const { deleteCount, insertText, moveAfter } = computeDiff(syncedValue, currentValue);
+
+      if (deleteCount > 0 || insertText.length > 0) {
+        socket.emit("sync_diff", {
+          delete: deleteCount,
+          insert: insertText,
+          move_after: moveAfter
+        });
+      }
+
+      syncedValue = currentValue;
+    }
+
+    function scheduleTextSync(delayMs = 55) {
+      if (syncTimer) clearTimeout(syncTimer);
+      syncTimer = setTimeout(flushTextSync, delayMs);
+    }
+
+    editor.addEventListener("compositionstart", () => {
+      isComposing = true;
+      if (syncTimer) clearTimeout(syncTimer);
+    });
+
+    editor.addEventListener("compositionend", () => {
+      isComposing = false;
+      scheduleTextSync(45);
+    });
+
+    editor.addEventListener("input", (e) => {
+      if (isComposing) return;
+      const delay = e.inputType === "insertReplacementText" ? 65 : 50;
+      scheduleTextSync(delay);
+    });
+
+    /* ---------- Boutons principaux ---------- */
+    $("escBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("key_esc");
+    });
+
+    $("tabBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("key_tab");
+    });
+
+    $("prtscBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("key_prtsc");
+    });
+
+    $("selectAllBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("shortcut", { action: "select_all" });
+      // La sélection sur le PC sera remplacée par la prochaine saisie :
+      // le champ du téléphone repart de zéro pour rester aligné.
+      resetMirror();
+    });
+
+    $("copyBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("shortcut", { action: "copy" });
+    });
+
+    $("pasteBtn").addEventListener("click", () => {
+      flushTextSync();
+      socket.emit("shortcut", { action: "paste" });
+    });
+
+    /* Appui maintenu = répétition (⌫, flèches, Suppr, Page, Espace) */
+    function bindRepeat(btn, fn) {
+      let delayTimer = null;
+      let repTimer = null;
+      const stop = () => {
+        clearTimeout(delayTimer);
+        clearInterval(repTimer);
+        delayTimer = null;
+        repTimer = null;
+      };
+      btn.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        fn();
+        delayTimer = setTimeout(() => {
+          repTimer = setInterval(fn, 70);
+        }, 380);
+      });
+      ["pointerup", "pointercancel", "pointerleave"].forEach((ev) => btn.addEventListener(ev, stop));
+      btn.addEventListener("contextmenu", (e) => e.preventDefault());
+    }
+
+    function doBackspace() {
+      flushTextSync();
+      socket.emit("backspace");
+      if (syncedValue.length > 0) {
+        syncedValue = syncedValue.slice(0, -1);
+        editor.value = syncedValue;
+      }
+    }
+
+    bindRepeat($("backspaceBtn"), doBackspace);
+
+    $("clearBtn").addEventListener("click", () => {
+      resetMirror();
+      focusEditorForKeyboard();
+    });
+
+    /* ---------- Pavé tactile ---------- */
+    function centroid(touches) {
+      let x = 0;
+      let y = 0;
+      for (const t of touches) {
+        x += t.clientX;
+        y += t.clientY;
+      }
+      return { x: x / touches.length, y: y / touches.length };
+    }
+
+    function moveMouse(rawDx, rawDy) {
+      let gain = sensitivity;
+      if (settings.accel) {
+        const speed = Math.hypot(rawDx, rawDy);
+        gain *= Math.min(1 + speed * 0.05, 2.6);
+      }
+      mvX += rawDx * gain;
+      mvY += rawDy * gain;
+      const ix = Math.trunc(mvX);
+      const iy = Math.trunc(mvY);
+      if (ix !== 0 || iy !== 0) {
+        mvX -= ix;
+        mvY -= iy;
+        socket.emit("mouse_move", { dx: ix, dy: iy });
+      }
+    }
+
+    trackpad.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 1) {
+        tpMaxTouches = 1;
+        tpMulti = false;
+        startTime = Date.now();
+        movedDistance = 0;
+        mvX = 0;
+        mvY = 0;
+        twoRemX = 0;
+        twoRemY = 0;
+      } else {
+        tpMaxTouches = Math.max(tpMaxTouches, e.touches.length);
+        tpMulti = true;
+      }
+      const c = centroid(e.touches);
+      tpCx = c.x;
+      tpCy = c.y;
+    }, { passive: true });
+
+    trackpad.addEventListener("touchmove", (e) => {
+      const c = centroid(e.touches);
+      const rawDx = c.x - tpCx;
+      const rawDy = c.y - tpCy;
+      tpCx = c.x;
+      tpCy = c.y;
+      movedDistance += Math.hypot(rawDx, rawDy);
+
+      if (e.touches.length >= 2) {
+        // Deux doigts : défilement (sens « tactile » : doigts vers le haut = descendre)
+        twoRemX += -rawDx * scrollSensitivity;
+        twoRemY += rawDy * scrollSensitivity;
+        const sx = Math.trunc(twoRemX);
+        const sy = Math.trunc(twoRemY);
+        if (sx !== 0 || sy !== 0) {
+          twoRemX -= sx;
+          twoRemY -= sy;
+          socket.emit("mouse_scroll", { dx: sx, dy: sy });
+        }
+        return;
+      }
+      if (tpMulti) return;
+      moveMouse(rawDx, rawDy);
+    }, { passive: true });
+
+    trackpad.addEventListener("touchend", (e) => {
+      if (e.touches.length > 0) {
+        const c = centroid(e.touches);
+        tpCx = c.x;
+        tpCy = c.y;
+        return;
+      }
+      const duration = Date.now() - startTime;
+      const limit = tpMaxTouches >= 2 ? 300 : 220;
+      if (duration < limit && movedDistance < 7) {
+        if (tpMaxTouches >= 2) {
+          socket.emit("mouse_click", { button: "right" });
+          haptic("medium");
+        } else if (!leftHoldActive) {
+          // Deux taps rapides = deux clics successifs = double-clic Windows
+          socket.emit("mouse_click", { button: "left" });
+          haptic("light");
+        }
+      }
+      tpMaxTouches = 0;
+      tpMulti = false;
+    });
+
+    trackpad.addEventListener("touchcancel", () => {
+      tpMaxTouches = 0;
+      tpMulti = false;
+    });
+
+    /* ---------- Défilement : barre latérale ---------- */
+    $("scrollTopBtn").addEventListener("click", () => {
+      socket.emit("mouse_jump", { direction: "top" });
+    });
+
+    $("scrollBottomBtn").addEventListener("click", () => {
+      socket.emit("mouse_jump", { direction: "bottom" });
+    });
+
+    scrollBar.addEventListener("touchstart", (e) => {
+      const t = e.touches[0];
+      scrollLastY = t.clientY;
+      scrollRemainder = 0;
+      scrollBar.classList.add("scrolling");
+    }, { passive: true });
+
+    scrollBar.addEventListener("touchmove", (e) => {
+      const t = e.touches[0];
+      if (scrollLastY === null) return;
+
+      const deltaPx = t.clientY - scrollLastY;
+      scrollLastY = t.clientY;
+
+      scrollRemainder += (-deltaPx) * scrollSensitivity;
+      const steps = Math.trunc(scrollRemainder);
+      if (steps !== 0) {
+        scrollRemainder -= steps;
+        socket.emit("mouse_scroll", { dx: 0, dy: steps });
+      }
+    }, { passive: true });
+
+    function endScroll() {
+      scrollLastY = null;
+      scrollRemainder = 0;
+      scrollBar.classList.remove("scrolling");
+    }
+
+    scrollBar.addEventListener("touchend", endScroll);
+    scrollBar.addEventListener("touchcancel", endScroll);
+
+    leftHoldBtn.addEventListener("click", () => {
+      const nextState = !leftHoldActive;
+      setLeftHoldUI(nextState);
+      socket.emit("mouse_left_hold", { hold: nextState });
+    });
+
+    $("rightClickBtn").addEventListener("click", () => {
+      socket.emit("mouse_click", { button: "right" });
+    });
+
+    $("stopBtn").addEventListener("click", () => {
+      if (confirm("Arrêter le serveur sur le PC ?")) {
+        flushTextSync();
+        if (leftHoldActive) {
+          setLeftHoldUI(false);
+          socket.emit("mouse_left_hold", { hold: false });
+        }
+        socket.emit("stop_server");
+        setStatus("bad", "Arrêt demandé…");
+      }
+    });
+
+    /* ---------- Panneau « Plus d'actions » ---------- */
+    const menu = $("menu");
+    const menuBackdrop = $("menuBackdrop");
+
+    function openMenu() {
+      flushTextSync();
+      editor.blur();
+      menu.classList.add("open");
+      menuBackdrop.classList.add("open");
+    }
+
+    function closeMenu() {
+      menu.classList.remove("open");
+      menuBackdrop.classList.remove("open");
+    }
+
+    $("menuBtn").addEventListener("click", openMenu);
+    $("menuClose").addEventListener("click", closeMenu);
+    menuBackdrop.addEventListener("click", closeMenu);
+
+    function sendKey(name) {
+      flushTextSync();
+      socket.emit("key_press", { key: name, count: 1 });
+      // Le curseur ou le contenu du PC a bougé : le champ du téléphone repart de zéro.
+      resetMirror();
+    }
+
+    menu.querySelectorAll("[data-key]").forEach((btn) => {
+      if (btn.dataset.repeat) {
+        bindRepeat(btn, () => sendKey(btn.dataset.key));
+      } else {
+        btn.addEventListener("click", () => sendKey(btn.dataset.key));
+      }
+    });
+
+    menu.querySelectorAll("[data-combo]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        flushTextSync();
+        socket.emit("hotkey", { name: btn.dataset.combo });
+        if (btn.dataset.combo === "undo" || btn.dataset.combo === "redo" || btn.dataset.combo === "cut") {
+          resetMirror();
+        }
+      });
+    });
+
+    menu.querySelectorAll("[data-media]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        socket.emit("media", { name: btn.dataset.media });
+      });
+    });
+
+    /* ---------- Presse-papier partagé ---------- */
+    const clipText = $("clipText");
+    const clipInfo = $("clipInfo");
+
+    $("clipGetBtn").addEventListener("click", () => {
+      clipInfo.textContent = "Lecture du presse-papier du PC…";
+      socket.emit("clipboard_get");
+    });
+
+    socket.on("clipboard_text", (d) => {
+      const text = (d && d.text) || "";
+      clipText.value = text;
+      clipInfo.textContent = text
+        ? "Reçu du PC (" + text.length + " caractères)"
+        : "Presse-papier du PC vide ou sans texte";
+    });
+
+    $("clipPhoneBtn").addEventListener("click", () => {
+      if (!clipText.value) {
+        clipInfo.textContent = "Rien à copier";
+        return;
+      }
+      let ok = false;
+      try {
+        clipText.focus();
+        clipText.select();
+        clipText.setSelectionRange(0, clipText.value.length);
+        ok = document.execCommand("copy");
+      } catch (e) {}
+      clipText.blur();
+      clipInfo.textContent = ok ? "Copié sur le téléphone" : "Copie impossible : sélectionne le texte à la main";
+    });
+
+    function sendClipboard(paste) {
+      const text = clipText.value || editor.value;
+      if (!text) {
+        clipInfo.textContent = "Rien à envoyer";
+        return;
+      }
+      clipInfo.textContent = "Envoi…";
+      socket.emit("clipboard_set", { text: text, paste: paste });
+    }
+
+    $("clipSendBtn").addEventListener("click", () => sendClipboard(false));
+    $("clipPasteBtn").addEventListener("click", () => {
+      sendClipboard(true);
+      closeMenu();
+    });
+
+    socket.on("clipboard_done", (d) => {
+      if (!d || !d.ok) {
+        clipInfo.textContent = "Échec de l'envoi au presse-papier du PC";
+      } else {
+        clipInfo.textContent = d.pasted ? "Envoyé et collé sur le PC" : "Envoyé au presse-papier du PC";
+      }
+    });
+
+    /* ---------- Options ---------- */
+    const optMap = {
+      optAutoKb: "autoKb",
+      optPrefill: "prefill",
+      optScroll: "showScroll",
+      optAccel: "accel",
+      optWake: "wake",
+      optHaptic: "haptic"
+    };
+    const segButtons = Array.from($("hapticSeg").querySelectorAll("button"));
+
+    function syncSettingsUI() {
+      Object.keys(optMap).forEach((id) => { $(id).checked = !!settings[optMap[id]]; });
+      scrollColumn.classList.toggle("hidden", !settings.showScroll);
+      pointerArea.classList.toggle("no-scroll", !settings.showScroll);
+      hapticBtn.classList.toggle("on", !!settings.haptic && canVibrate);
+      segButtons.forEach((b) => b.classList.toggle("on", Number(b.dataset.level) === Number(settings.hapticLevel)));
+    }
+
+    function applySettings(changed) {
+      syncSettingsUI();
+      if (changed === "autoKb" && !settings.autoKb) {
+        resetFieldUI();
+        editor.inputMode = "text";
+        autoOpened = false;
+      }
+      if (changed === "prefill") {
+        socket.emit("set_prefill", { enabled: settings.prefill });
+      }
+      if (changed === "wake") {
+        if (settings.wake) requestWake();
+        else releaseWake();
+      }
+      if (changed === "haptic" && settings.haptic) {
+        haptic("medium");
+      }
+    }
+
+    Object.keys(optMap).forEach((id) => {
+      const el = $(id);
+      const key = optMap[id];
+      el.addEventListener("change", () => {
+        settings[key] = el.checked;
+        saveSettings();
+        applySettings(key);
+        if (key !== "haptic") haptic("medium");
+      });
+    });
+
+    hapticBtn.addEventListener("click", () => {
+      settings.haptic = !settings.haptic;
+      saveSettings();
+      applySettings("haptic");
+    });
+
+    segButtons.forEach((b) => {
+      b.addEventListener("click", () => {
+        settings.hapticLevel = Number(b.dataset.level);
+        saveSettings();
+        syncSettingsUI();
+        haptic("medium");
+      });
+    });
+
+    if (!canVibrate) {
+      $("hapticNote").textContent = "Non pris en charge par ce navigateur (iPhone / Safari)";
+      hapticBtn.disabled = true;
+      $("optHaptic").disabled = true;
+      segButtons.forEach((b) => { b.disabled = true; });
+    }
+
+    $("changePinBtn").addEventListener("click", () => {
+      closeMenu();
+      socket.disconnect();
+      currentPin = "";
+      try { localStorage.removeItem("rc_pin"); } catch (e) {}
+      setStatus("warn", "Déconnecté");
+      showPinGate("");
+    });
+
+    /* ---------- Installation de la PWA ---------- */
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+    }
+
+    const installBox = $("installBox");
+    const installBtn = $("installBtn");
+    const installInfo = $("installInfo");
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+    let deferredInstall = null;
+
+    function updateInstallUI() {
+      if (isStandalone) {
+        installBox.style.display = "none";
+        return;
+      }
+      if (deferredInstall) {
+        installBtn.style.display = "inline-flex";
+        installInfo.textContent = "";
+        return;
+      }
+      installBtn.style.display = "none";
+      if (!window.isSecureContext) {
+        installInfo.textContent =
+          "Android : Chrome n'installe que les sites en HTTPS. Pour autoriser cette adresse, ouvre " +
+          "chrome://flags, active « Insecure origins treated as secure », ajoute " + location.origin +
+          " puis relance Chrome. iPhone : Partager > Sur l'écran d'accueil.";
+      } else {
+        installInfo.textContent =
+          "Menu du navigateur > Installer l'application (ou Ajouter à l'écran d'accueil).";
+      }
+    }
+
+    window.addEventListener("beforeinstallprompt", (e) => {
+      e.preventDefault();
+      deferredInstall = e;
+      updateInstallUI();
+    });
+
+    window.addEventListener("appinstalled", () => {
+      deferredInstall = null;
+      updateInstallUI();
+    });
+
+    installBtn.addEventListener("click", async () => {
+      if (!deferredInstall) return;
+      try {
+        deferredInstall.prompt();
+        await deferredInstall.userChoice;
+      } catch (e) {}
+      deferredInstall = null;
+      updateInstallUI();
+    });
+
+    updateInstallUI();
+
+    /* ---------- Démarrage ---------- */
+    applySettings("init");
+    setLeftHoldUI(false);
+    connectWithPin();
+  </script>
+
+<style id="mastercode-install-style">
+#mastercode-install{
+  position:fixed;
+  left:16px;
+  right:16px;
+  bottom:calc(16px + env(safe-area-inset-bottom, 0px));
+  z-index:2147483000;
+  width:auto;
+  max-width:460px;
+  margin:0 auto;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+#mastercode-install[hidden],
+#mastercode-install-panel[hidden]{
+  display:none!important;
+}
+#mastercode-install-button{
+  width:100%;
+  min-height:54px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:11px;
+  padding:13px 20px;
+  border:1px solid rgba(255,224,155,.5);
+  border-radius:17px;
+  color:#17130a;
+  background:linear-gradient(135deg,#f5d88f 0%,#e8b84c 48%,#d6a23a 100%);
+  box-shadow:0 9px 30px rgba(0,0,0,.3),0 0 24px rgba(232,184,76,.16);
+  font-size:13px;
+  font-weight:850;
+  letter-spacing:.045em;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+  transition:transform .15s ease,filter .15s ease;
+}
+#mastercode-install-button:active{
+  transform:scale(.98);
+  filter:brightness(.95);
+}
+#mastercode-install-button svg{
+  width:21px;
+  height:21px;
+  flex-shrink:0;
+}
+#mastercode-install-panel{
+  margin-bottom:10px;
+  padding:17px;
+  color:#f8fafc;
+  background:rgba(17,19,25,.97);
+  border:1px solid rgba(232,184,76,.3);
+  border-radius:18px;
+  box-shadow:0 14px 45px rgba(0,0,0,.48);
+  backdrop-filter:blur(18px);
+  -webkit-backdrop-filter:blur(18px);
+}
+#mastercode-install-panel .mc-install-title{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:12px;
+  color:#f3d58f;
+  font-size:14px;
+  font-weight:850;
+}
+#mastercode-install-panel .mc-install-close{
+  width:30px;
+  height:30px;
+  border:1px solid rgba(255,255,255,.1);
+  border-radius:9px;
+  color:#cbd5e1;
+  background:rgba(255,255,255,.06);
+  font-size:19px;
+  cursor:pointer;
+}
+#mastercode-install-panel .mc-install-step{
+  display:flex;
+  align-items:flex-start;
+  gap:11px;
+  margin-top:12px;
+  color:#cbd5e1;
+  font-size:12px;
+  line-height:1.55;
+}
+#mastercode-install-panel .mc-install-number{
+  width:25px;
+  height:25px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0;
+  border-radius:8px;
+  color:#e8b84c;
+  background:rgba(232,184,76,.12);
+  font-size:11px;
+  font-weight:900;
+}
+#mastercode-install-panel strong{
+  color:#fff;
+}
+#mastercode-install-panel .mc-install-note{
+  margin-top:13px;
+  padding-top:11px;
+  border-top:1px solid rgba(255,255,255,.08);
+  color:#94a3b8;
+  font-size:10px;
+  line-height:1.5;
+}
+@media(min-width:700px){
+  #mastercode-install{
+    bottom:24px;
+  }
+}
+</style>
+
+<div id="mastercode-install" hidden>
+  <div id="mastercode-install-panel" hidden>
+    <div class="mc-install-title">
+      <span>Installer sur votre téléphone</span>
+      <button type="button" class="mc-install-close" id="mastercode-install-close" aria-label="Fermer">×</button>
+    </div>
+    <div class="mc-install-step">
+      <span class="mc-install-number">1</span>
+      <span>Appuyez sur le bouton <strong>Partager</strong> de Safari.</span>
+    </div>
+    <div class="mc-install-step">
+      <span class="mc-install-number">2</span>
+      <span>Faites défiler les options et choisissez <strong>Sur l’écran d’accueil</strong>.</span>
+    </div>
+    <div class="mc-install-step">
+      <span class="mc-install-number">3</span>
+      <span>Appuyez sur <strong>Ajouter</strong> pour installer l’application.</span>
+    </div>
+    <div class="mc-install-note">L’application sera accessible directement depuis l’écran d’accueil de votre iPhone.</div>
+  </div>
+
+  <button type="button" id="mastercode-install-button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="4" y="3" width="16" height="18" rx="3"/>
+      <path d="M12 8v8M8.5 12.5 12 16l3.5-3.5"/>
+    </svg>
+    <span>INSTALLER L’APPLICATION</span>
+  </button>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  const root = document.getElementById('mastercode-install');
+  const button = document.getElementById('mastercode-install-button');
+  const panel = document.getElementById('mastercode-install-panel');
+  const close = document.getElementById('mastercode-install-close');
+
+  if(!root || !button || !panel) return;
+
+  const standalone = window.matchMedia('(display-mode: standalone)').matches ||
+    window.navigator.standalone === true;
+
+  if(standalone) return;
+
+  const ua = navigator.userAgent || '';
+  const isIOS = /iphone|ipad|ipod/i.test(ua) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  let deferredPrompt = null;
+
+  if(isIOS){
+    root.hidden = false;
+  }
+
+  window.addEventListener('beforeinstallprompt', function(event){
+    event.preventDefault();
+    deferredPrompt = event;
+    root.hidden = false;
+    panel.hidden = true;
+  });
+
+  button.addEventListener('click', async function(){
+    if(deferredPrompt){
+      const promptEvent = deferredPrompt;
+      deferredPrompt = null;
+
+      try{
+        await promptEvent.prompt();
+        const result = await promptEvent.userChoice;
+
+        if(result && result.outcome === 'accepted'){
+          root.hidden = true;
+          panel.hidden = true;
+        }
+      }catch(error){
+        console.error('Installation PWA:', error);
+      }
+      return;
+    }
+
+    if(isIOS){
+      panel.hidden = !panel.hidden;
+    }
+  });
+
+  if(close){
+    close.addEventListener('click', function(){
+      panel.hidden = true;
+    });
+  }
+
+  window.addEventListener('appinstalled', function(){
+    root.hidden = true;
+    panel.hidden = true;
+    deferredPrompt = null;
+  });
+})();
+</script>
+    
+</body>
+</html>
