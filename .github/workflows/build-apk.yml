@@ -1,0 +1,2346 @@
+name: Build APK Android
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Configuration Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configuration Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: Cache Gradle et NPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.npm
+          key: ${{ runner.os }}-build-${{ hashFiles('**/*.gradle*', '**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Construction de l'environnement PWA → APK
+        run: |
+          mkdir -p capacitor-app/www
+          rsync -av --exclude='capacitor-app' --exclude='.git' --exclude='.github' ./ capacitor-app/www/
+          cd capacitor-app
+          npm init -y
+          npm install @capacitor/core @capacitor/android @capacitor/haptics @capacitor/local-notifications
+          npm install @capawesome-team/capacitor-android-foreground-service
+          npm install -D @capacitor/cli
+          cat > capacitor.config.json << JSONEOF
+          {
+            "appId": "com.mekeirish.remotecontrol",
+            "appName": "Remote-control",
+            "webDir": "www",
+            "bundledWebRuntime": true
+          }
+          JSONEOF
+          npx cap init "Remote-control" "com.mekeirish.remotecontrol" --web-dir www
+          npx cap add android
+
+      - name: 🔐 Détection et injection automatique des permissions
+        run: |
+          cd capacitor-app/www
+          MANIFEST="../android/app/src/main/AndroidManifest.xml"
+          add_permission() {
+            local perm="$1"
+            if ! grep -q "android.permission.$perm" "$MANIFEST"; then
+              sed -i "/<manifest/a\    <uses-permission android:name=\"android.permission.$perm\" />" "$MANIFEST"
+            fi
+          }
+          rm -f .need_*_shim
+          add_permission "INTERNET"
+          add_permission "ACCESS_NETWORK_STATE"
+          if grep -rq -E "passerAppelDirect" .; then add_permission "CALL_PHONE"; touch .need_call_shim; fi
+          if grep -rq -E "navigator\.vibrate|\.vibrate\(" .; then add_permission "VIBRATE"; touch .need_vibrate_shim; fi
+          if grep -rq -E "navigator\.geolocation|getCurrentPosition|watchPosition" .; then
+            add_permission "ACCESS_FINE_LOCATION"
+            add_permission "ACCESS_COARSE_LOCATION"
+            touch .need_geolocation_shim
+          fi
+          if grep -rq "getUserMedia" . && grep -rq -E "video\s*:\s*(true|\{)" .; then add_permission "CAMERA"; touch .need_camera_shim; fi
+          if grep -rq "getUserMedia" . && grep -rq -E "audio\s*:\s*(true|\{)" .; then
+            add_permission "RECORD_AUDIO"
+            add_permission "MODIFY_AUDIO_SETTINGS"
+            add_permission "FOREGROUND_SERVICE"
+            add_permission "FOREGROUND_SERVICE_MICROPHONE"
+            add_permission "WAKE_LOCK"
+            touch .need_microphone_shim
+            touch .need_bg_service
+          fi
+          if grep -rq -E "new Notification\(|Notification\.requestPermission" .; then 
+            add_permission "POST_NOTIFICATIONS"
+            touch .need_notification_shim
+          fi
+
+      - name: 🔧 Configuration Service Arrière-plan
+        run: |
+          cd capacitor-app
+          if [ -f www/.need_bg_service ]; then
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            if ! grep -q "AndroidForegroundService" "$MANIFEST"; then
+              sed -i '/<\/application>/i \        <receiver android:name="io.capawesome.capacitorjs.plugins.foregroundservice.NotificationActionBroadcastReceiver" />\n        <service android:name="io.capawesome.capacitorjs.plugins.foregroundservice.AndroidForegroundService" android:foregroundServiceType="microphone" android:exported="false" />' "$MANIFEST"
+            fi
+          fi
+
+      - name: 📱 Configuration des permissions natives (MainActivity)
+        run: |
+          cd capacitor-app
+          MAIN_ACTIVITY="android/app/src/main/java/com/mekeirish/remotecontrol/MainActivity.java"
+          
+          REQ_CODE=""
+          if [ -f www/.need_microphone_shim ]; then
+            REQ_CODE="$REQ_CODE
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      permissionsNeeded.add(Manifest.permission.RECORD_AUDIO);
+                  }"
+          fi
+          if [ -f www/.need_notification_shim ]; then
+            REQ_CODE="$REQ_CODE
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          permissionsNeeded.add(Manifest.permission.POST_NOTIFICATIONS);
+                      }
+                  }"
+          fi
+
+          cat > $MAIN_ACTIVITY << EOF
+          package com.mekeirish.remotecontrol;
+          
+          import android.Manifest;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import java.util.ArrayList;
+          import java.util.List;
+          
+          public class MainActivity extends BridgeActivity {
+              private static final int PERMISSION_REQUEST_CODE = 1001;
+          
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  
+                  WebView webView = this.bridge.getWebView();
+                  webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
+          
+                  List<String> permissionsNeeded = new ArrayList<>();
+                  ${REQ_CODE}
+                  
+                  if (!permissionsNeeded.isEmpty()) {
+                      ActivityCompat.requestPermissions(this, permissionsNeeded.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                  }
+              }
+          }
+          EOF
+
+      - name: 🌉 Injection des shims
+        run: |
+          cd capacitor-app/www
+          NEED_VIBRATE=false
+          NEED_NOTIFICATION=false
+          [ -f .need_vibrate_shim ] && NEED_VIBRATE=true
+          [ -f .need_notification_shim ] && NEED_NOTIFICATION=true
+          if [ "$NEED_VIBRATE" = "true" ] || [ "$NEED_NOTIFICATION" = "true" ]; then
+            cat > shims.js << 'SHIMEOF'
+          (function() {
+            var Capacitor = window.Capacitor;
+            console.log('🔌 Shims:', !!(Capacitor && Capacitor.Plugins) ? 'natif' : 'web');
+          })();
+          SHIMEOF
+            if [ "$NEED_VIBRATE" = "true" ]; then
+              cat >> shims.js << 'VIBEOF'
+          (function() {
+            var C = window.Capacitor;
+            if (C && C.Plugins && C.Plugins.Haptics) {
+              navigator.vibrate = function(p) {
+                var d = (typeof p === 'number') ? p : (Array.isArray(p) && p.length) ? p[0] : 200;
+                try { C.Plugins.Haptics.vibrate({ duration: d }); } catch(e) {}
+                return true;
+              };
+            }
+          })();
+          VIBEOF
+            fi
+            if [ "$NEED_NOTIFICATION" = "true" ]; then
+              cat >> shims.js << 'NOTIFEOF'
+          (function() {
+            var C = window.Capacitor;
+            if (C && C.Plugins && C.Plugins.LocalNotifications) {
+              C.Plugins.LocalNotifications.createChannel({
+                id: 'default', name: 'Notifications', importance: 5, visibility: 1
+              }).catch(function(){});
+              window.Notification = function(title, options) {
+                options = options || {};
+                C.Plugins.LocalNotifications.schedule({
+                  notifications: [{
+                    id: Math.floor(Math.random() * 2147483647),
+                    title: title || '',
+                    body: options.body || '',
+                    channelId: 'default',
+                    schedule: { at: new Date(Date.now() + 1000) }
+                  }]
+                }).catch(function(){});
+                return { close: function() {} };
+              };
+              window.Notification.requestPermission = function() {
+                return C.Plugins.LocalNotifications.requestPermissions().then(function(r) {
+                  return r.display === 'granted' ? 'granted' : 'denied';
+                });
+              };
+              window.Notification.permission = 'default';
+            }
+          })();
+          NOTIFEOF
+            fi
+          fi
+
+      - name: 🔌 Injection du Bridge et Background
+        run: |
+          cd capacitor-app/www
+          if [ -f .need_bg_service ]; then
+            cat > background.js << 'BGEOF'
+          (function() {
+            var started = false;
+            function startService() {
+              var C = window.Capacitor;
+              if (started || !C || !C.Plugins || !C.Plugins.ForegroundService) return;
+              started = true;
+              var FS = C.Plugins.ForegroundService;
+              FS.requestPermissions().catch(function(){}).then(function() {
+                return FS.createNotificationChannel({
+                  id: 'talkie_channel',
+                  name: 'Talkie-Walkie Audio',
+                  importance: 3
+                }).catch(function(){});
+              }).then(function() {
+                return FS.startForegroundService({
+                  id: 1,
+                  title: 'Talkie-Walkie Actif',
+                  body: 'Communication en cours en arrière-plan...',
+                  notificationChannelId: 'talkie_channel',
+                  smallIcon: 'ic_launcher'
+                });
+              }).then(function() {
+                FS.acquireWakeLock({ tag: 'talkie', timeout: 0 }).catch(function(){});
+              }).catch(function(e) {
+                started = false;
+                console.log("Erreur service premier plan:", e);
+              });
+            }
+            var md = navigator.mediaDevices;
+            if (md && md.getUserMedia) {
+              var orig = md.getUserMedia.bind(md);
+              md.getUserMedia = function(c) {
+                return orig(c).then(function(s) {
+                  if (c && c.audio) startService();
+                  return s;
+                });
+              };
+            }
+          })();
+          BGEOF
+          fi
+          
+          MAIN_HTML=$(find . -maxdepth 1 -name "*.html" | head -n 1)
+          if [ -n "$MAIN_HTML" ]; then
+            curl -f -s -o bridge.js "https://raw.githubusercontent.com/mekeirish/APK-Creator/main/bridge.js"
+            if [ -f "../node_modules/@capacitor/core/dist/capacitor.js" ]; then
+              cp ../node_modules/@capacitor/core/dist/capacitor.js capacitor.js
+            else
+              touch capacitor.js
+            fi
+            node -e "
+              const fs = require('fs');
+              const h = '${MAIN_HTML}';
+              let c = fs.readFileSync(h, 'utf8');
+              let parts = c.split(/<\/body>/i);
+              if (parts.length > 1) {
+                let last = parts.pop();
+                let s = '<script src="capacitor.js"><\/script>\n';
+                if (fs.existsSync('shims.js')) s += '<script src="shims.js"><\/script>\n';
+                if (fs.existsSync('background.js')) s += '<script src="background.js"><\/script>\n';
+                s += '<script src="bridge.js"><\/script>\n</body>';
+                fs.writeFileSync(h, parts.join('</body>') + s + last, 'utf8');
+              } else {
+                let a = '<script src="capacitor.js"><\/script>\n';
+                if (fs.existsSync('shims.js')) a += '<script src="shims.js"><\/script>\n';
+                if (fs.existsSync('background.js')) a += '<script src="background.js"><\/script>\n';
+                a += '<script src="bridge.js"><\/script>\n';
+                fs.appendFileSync(h, a);
+              }
+            "
+          fi
+
+      - name: 🔄 Sync assets Android
+        run: |
+          cd capacitor-app
+          npx cap sync android
+
+      - name: 🎙️ Son interne natif (plugin MediaProjection)
+        run: |
+          cd capacitor-app
+          if grep -rqE "Plugins[.]InternalAudio" www; then
+            echo "Plugin InternalAudio detecte"
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            JAVA_DIR="android/app/src/main/java/com/mekeirish/remotecontrol"
+            for P in RECORD_AUDIO MODIFY_AUDIO_SETTINGS FOREGROUND_SERVICE FOREGROUND_SERVICE_MEDIA_PROJECTION FOREGROUND_SERVICE_MICROPHONE POST_NOTIFICATIONS WAKE_LOCK; do
+              if ! grep -q "android.permission.$P" "$MANIFEST"; then
+                sed -i "/<manifest/a\    <uses-permission android:name=\"android.permission.$P\" />" "$MANIFEST"
+              fi
+            done
+            if ! grep -q "InternalAudioService" "$MANIFEST"; then
+              sed -i '/<\/application>/i \        <service android:name="com.mekeirish.remotecontrol.InternalAudioService" android:exported="false" android:foregroundServiceType="mediaProjection|microphone" />' "$MANIFEST"
+            fi
+            mkdir -p "$JAVA_DIR"
+
+            cat > "$JAVA_DIR/InternalAudioService.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.annotation.SuppressLint;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioPlaybackCaptureConfiguration;
+          import android.media.AudioRecord;
+          import android.media.MediaRecorder;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Build;
+          import android.os.IBinder;
+          import java.io.IOException;
+          import java.io.RandomAccessFile;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+
+          @SuppressLint({"NewApi", "MissingPermission"})
+          public class InternalAudioService extends Service {
+              public static final String CHANNEL_ID = "recorder_capture";
+              public static final int RATE = 44100;
+              public static volatile boolean running = false;
+              public static volatile boolean stopRequested = false;
+              public static volatile long startedAt = 0;
+              public static volatile long lastDuration = 0;
+              public static volatile double level = 0;
+              public static volatile String lastPath = null;
+              public static volatile String lastError = null;
+
+              private MediaProjection projection;
+              private AudioRecord internalRec;
+              private AudioRecord micRec;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent == null || !"START".equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  final boolean withMic = intent.getBooleanExtra("withMic", false);
+                  final String path = intent.getStringExtra("path");
+                  final int resultCode = intent.getIntExtra("resultCode", 0);
+                  final Intent data = intent.getParcelableExtra("data");
+                  try {
+                      startAsForeground(withMic);
+                      MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                      projection = mpm.getMediaProjection(resultCode, data);
+                      if (projection == null) throw new IllegalStateException("Projection indisponible");
+                      projection.registerCallback(new MediaProjection.Callback() {
+                          @Override
+                          public void onStop() {
+                              stopRequested = true;
+                          }
+                      }, null);
+
+                      AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                              .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                              .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                              .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                              .build();
+                      AudioFormat fmt = new AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(RATE)
+                              .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                              .build();
+                      int minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+                      int bufSize = Math.max(minBuf * 2, 16384);
+                      internalRec = new AudioRecord.Builder()
+                              .setAudioFormat(fmt)
+                              .setBufferSizeInBytes(bufSize)
+                              .setAudioPlaybackCaptureConfig(cfg)
+                              .build();
+
+                      if (withMic) {
+                          AudioFormat mf = new AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setSampleRate(RATE)
+                                  .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                  .build();
+                          int minMic = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                          micRec = new AudioRecord.Builder()
+                                  .setAudioSource(MediaRecorder.AudioSource.MIC)
+                                  .setAudioFormat(mf)
+                                  .setBufferSizeInBytes(Math.max(minMic * 2, 8192))
+                                  .build();
+                      }
+                  } catch (Exception e) {
+                      fail(e.getMessage());
+                      return START_NOT_STICKY;
+                  }
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          capture(path, withMic);
+                      }
+                  }).start();
+                  return START_NOT_STICKY;
+              }
+
+              private void startAsForeground(boolean withMic) {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  Notification.Builder b;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Enregistrement", NotificationManager.IMPORTANCE_LOW);
+                      nm.createNotificationChannel(ch);
+                      b = new Notification.Builder(this, CHANNEL_ID);
+                  } else {
+                      b = new Notification.Builder(this);
+                  }
+                  b.setContentTitle("Enregistrement en cours")
+                          .setContentText("Capture audio active")
+                          .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                          .setOngoing(true);
+                  Notification n = b.build();
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+                      if (withMic && Build.VERSION.SDK_INT >= 30) {
+                          type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+                      }
+                      startForeground(1337, n, type);
+                  } else {
+                      startForeground(1337, n);
+                  }
+              }
+
+              private void fail(String msg) {
+                  lastError = (msg == null) ? "Erreur de capture" : msg;
+                  running = false;
+                  level = 0;
+                  try {
+                      if (projection != null) projection.stop();
+                  } catch (Exception e) {
+                  }
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              private void writeHeader(RandomAccessFile f, long dataLen, int channels) throws IOException {
+                  ByteBuffer b = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
+                  b.put(new byte[]{'R', 'I', 'F', 'F'});
+                  b.putInt((int) (36 + dataLen));
+                  b.put(new byte[]{'W', 'A', 'V', 'E'});
+                  b.put(new byte[]{'f', 'm', 't', ' '});
+                  b.putInt(16);
+                  b.putShort((short) 1);
+                  b.putShort((short) channels);
+                  b.putInt(RATE);
+                  b.putInt(RATE * channels * 2);
+                  b.putShort((short) (channels * 2));
+                  b.putShort((short) 16);
+                  b.put(new byte[]{'d', 'a', 't', 'a'});
+                  b.putInt((int) dataLen);
+                  f.seek(0);
+                  f.write(b.array());
+              }
+
+              private void capture(String path, boolean withMic) {
+                  RandomAccessFile f = null;
+                  long dataLen = 0;
+                  try {
+                      f = new RandomAccessFile(path, "rw");
+                      f.setLength(0);
+                      writeHeader(f, 0, 2);
+                      internalRec.startRecording();
+                      if (withMic && micRec != null) micRec.startRecording();
+                      short[] buf = new short[2048];
+                      short[] mic = new short[1024];
+                      ByteBuffer bb = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
+                      while (!stopRequested) {
+                          int n = internalRec.read(buf, 0, buf.length);
+                          if (n < 0) throw new IOException("Lecture audio interne : " + n);
+                          if (n == 0) continue;
+                          int frames = n / 2;
+                          int mn = 0;
+                          if (withMic && micRec != null) {
+                              mn = micRec.read(mic, 0, frames);
+                              if (mn < 0) mn = 0;
+                          }
+                          bb.clear();
+                          int peak = 0;
+                          for (int i = 0; i < frames; i++) {
+                              int l = buf[2 * i];
+                              int r = buf[2 * i + 1];
+                              if (i < mn) {
+                                  l += mic[i];
+                                  r += mic[i];
+                              }
+                              if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+                              if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+                              bb.putShort((short) l);
+                              bb.putShort((short) r);
+                              int a = Math.abs(l);
+                              if (a > peak) peak = a;
+                          }
+                          f.write(bb.array(), 0, frames * 4);
+                          dataLen += frames * 4;
+                          level = peak / 32768.0;
+                      }
+                  } catch (Exception e) {
+                      lastError = (e.getMessage() == null) ? "Erreur de capture" : e.getMessage();
+                  } finally {
+                      try { if (internalRec != null) { internalRec.stop(); internalRec.release(); } } catch (Exception e) { }
+                      try { if (micRec != null) { micRec.stop(); micRec.release(); } } catch (Exception e) { }
+                      try { if (projection != null) projection.stop(); } catch (Exception e) { }
+                      try {
+                          if (f != null) {
+                              writeHeader(f, dataLen, 2);
+                              f.close();
+                          }
+                      } catch (Exception e) { }
+                      lastPath = path;
+                      lastDuration = dataLen * 1000L / (RATE * 4L);
+                      level = 0;
+                      running = false;
+                      stopForeground(true);
+                      stopSelf();
+                  }
+              }
+          }
+          JAVAEOF
+
+            cat > "$JAVA_DIR/InternalAudioPlugin.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import androidx.activity.result.ActivityResult;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import java.io.ByteArrayInputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          @SuppressLint("NewApi")
+          @CapacitorPlugin(name = "InternalAudio", permissions = {
+                  @Permission(alias = "mic", strings = { Manifest.permission.RECORD_AUDIO })
+          })
+          public class InternalAudioPlugin extends Plugin {
+
+              private File recDir() {
+                  File d = new File(getContext().getFilesDir(), "recordings");
+                  d.mkdirs();
+                  return d;
+              }
+
+              @PluginMethod
+              public void start(PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 29) {
+                      call.reject("Android 10 minimum requis");
+                      return;
+                  }
+                  if (InternalAudioService.running) {
+                      call.reject("Deja en cours");
+                      return;
+                  }
+                  if (getPermissionState("mic") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("mic", call, "micPermCallback");
+                      return;
+                  }
+                  askProjection(call);
+              }
+
+              @PermissionCallback
+              private void micPermCallback(PluginCall call) {
+                  if (getPermissionState("mic") == PermissionState.GRANTED) {
+                      askProjection(call);
+                  } else {
+                      call.reject("Permission micro refusee");
+                  }
+              }
+
+              private void askProjection(PluginCall call) {
+                  MediaProjectionManager mpm = (MediaProjectionManager) getContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                  startActivityForResult(call, mpm.createScreenCaptureIntent(), "projectionResult");
+              }
+
+              @ActivityCallback
+              private void projectionResult(PluginCall call, ActivityResult result) {
+                  if (call == null) return;
+                  if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
+                      call.reject("Capture refusee");
+                      return;
+                  }
+                  boolean withMic = call.getBoolean("mic", false);
+                  String name = "rec_" + System.currentTimeMillis() + ".wav";
+                  File out = new File(recDir(), name);
+
+                  InternalAudioService.stopRequested = false;
+                  InternalAudioService.lastError = null;
+                  InternalAudioService.lastPath = null;
+                  InternalAudioService.level = 0;
+                  InternalAudioService.startedAt = System.currentTimeMillis();
+                  InternalAudioService.running = true;
+
+                  Intent svc = new Intent(getContext(), InternalAudioService.class);
+                  svc.setAction("START");
+                  svc.putExtra("resultCode", result.getResultCode());
+                  svc.putExtra("data", result.getData());
+                  svc.putExtra("withMic", withMic);
+                  svc.putExtra("path", out.getAbsolutePath());
+                  ContextCompat.startForegroundService(getContext(), svc);
+
+                  JSObject ret = new JSObject();
+                  ret.put("path", out.getAbsolutePath());
+                  ret.put("name", name);
+                  call.resolve(ret);
+              }
+
+              @PluginMethod
+              public void stop(PluginCall call) {
+                  InternalAudioService.stopRequested = true;
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void status(PluginCall call) {
+                  JSObject o = new JSObject();
+                  boolean run = InternalAudioService.running;
+                  o.put("running", run);
+                  o.put("elapsed", run ? System.currentTimeMillis() - InternalAudioService.startedAt : InternalAudioService.lastDuration);
+                  o.put("level", InternalAudioService.level);
+                  o.put("path", InternalAudioService.lastPath);
+                  o.put("error", InternalAudioService.lastError);
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void list(PluginCall call) {
+                  JSArray arr = new JSArray();
+                  File[] files = recDir().listFiles();
+                  if (files != null) {
+                      for (File x : files) {
+                          if (!x.getName().endsWith(".wav")) continue;
+                          JSObject o = new JSObject();
+                          o.put("name", x.getName());
+                          o.put("path", x.getAbsolutePath());
+                          o.put("size", x.length());
+                          o.put("modified", x.lastModified());
+                          arr.put(o);
+                      }
+                  }
+                  JSObject r = new JSObject();
+                  r.put("files", arr);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void remove(PluginCall call) {
+                  String path = call.getString("path");
+                  if (path == null) {
+                      call.reject("Chemin manquant");
+                      return;
+                  }
+                  File f = new File(path);
+                  if (f.getParentFile() != null && f.getParentFile().equals(recDir()) && f.delete()) {
+                      call.resolve();
+                  } else {
+                      call.reject("Suppression impossible");
+                  }
+              }
+
+              @PluginMethod
+              public void saveToDownloads(final PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 29) {
+                      call.reject("Android 10 minimum requis");
+                      return;
+                  }
+                  final String name = call.getString("name", "recording.wav").replaceAll("[^A-Za-z0-9._-]", "_");
+                  final String path = call.getString("path");
+                  final String data = call.getString("data");
+                  final String mime = call.getString("mime", "audio/wav");
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              InputStream in;
+                              if (path != null) {
+                                  File f = new File(path);
+                                  if (f.getParentFile() == null || !f.getParentFile().equals(recDir())) {
+                                      call.reject("Chemin refuse");
+                                      return;
+                                  }
+                                  in = new FileInputStream(f);
+                              } else if (data != null) {
+                                  in = new ByteArrayInputStream(Base64.decode(data, Base64.DEFAULT));
+                              } else {
+                                  call.reject("Aucune donnee");
+                                  return;
+                              }
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                              v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                              v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Recorder");
+                              ContentResolver cr = getContext().getContentResolver();
+                              Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              if (uri == null) throw new IOException("Insertion impossible");
+                              OutputStream out = cr.openOutputStream(uri);
+                              byte[] b = new byte[65536];
+                              int n;
+                              while ((n = in.read(b)) > 0) {
+                                  out.write(b, 0, n);
+                              }
+                              out.close();
+                              in.close();
+                              call.resolve();
+                          } catch (Exception e) {
+                              call.reject("Echec : " + e.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+          }
+          JAVAEOF
+
+            if ! grep -q "InternalAudioPlugin" "$JAVA_DIR/MainActivity.java"; then
+              sed -i 's/super.onCreate(savedInstanceState);/registerPlugin(InternalAudioPlugin.class);\n        super.onCreate(savedInstanceState);/' "$JAVA_DIR/MainActivity.java"
+            fi
+          else
+            echo "Pas de plugin InternalAudio requis"
+          fi
+
+      - name: 🔎 Vérification plugin son interne
+        run: |
+          cd capacitor-app
+          JD=android/app/src/main/java/com/mekeirish/remotecontrol
+          echo "--- Java ---"; ls -la $JD
+          echo "--- MainActivity ---"; cat $JD/MainActivity.java
+          echo "--- Manifest ---"; grep -n InternalAudio android/app/src/main/AndroidManifest.xml || echo "service absent"
+          if grep -rqE "Plugins[.]InternalAudio" www && [ ! -f $JD/InternalAudioPlugin.java ]; then echo "ERREUR : plugin non injecte"; exit 1; fi
+          if [ -f $JD/InternalAudioPlugin.java ] && ! grep -q "registerPlugin(InternalAudioPlugin.class)" $JD/MainActivity.java; then echo "ERREUR : plugin non enregistre"; exit 1; fi
+
+      - name: 🔔 Notifications natives qui reveillent l'appareil
+        run: |
+          cd capacitor-app
+          if [ -f www/.need_notification_shim ] || grep -rqE "showNotification|Plugins[.]WakeNotify|window[.]WakeNotify" www --exclude=capacitor.js --exclude=shims.js --exclude=bridge.js --exclude=background.js; then
+            echo "Notifications natives : activation"
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            JAVA_DIR="android/app/src/main/java/com/mekeirish/remotecontrol"
+            for P in POST_NOTIFICATIONS WAKE_LOCK VIBRATE RECEIVE_BOOT_COMPLETED SCHEDULE_EXACT_ALARM USE_EXACT_ALARM USE_FULL_SCREEN_INTENT REQUEST_IGNORE_BATTERY_OPTIMIZATIONS; do
+              if ! grep -q "android.permission.$P" "$MANIFEST"; then
+                sed -i "/<manifest/a\    <uses-permission android:name=\"android.permission.$P\" />" "$MANIFEST"
+              fi
+            done
+            if ! grep -q "showWhenLocked" "$MANIFEST"; then
+              sed -i '0,/<activity/s//<activity android:showWhenLocked="true" android:turnScreenOn="true"/' "$MANIFEST"
+            fi
+            if ! grep -q "WakeNotifyReceiver" "$MANIFEST"; then
+              sed -i '/<\/application>/i \        <receiver android:name="com.mekeirish.remotecontrol.WakeNotifyReceiver" android:exported="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.MY_PACKAGE_REPLACED" /><action android:name="android.intent.action.TIME_SET" /><action android:name="android.intent.action.TIMEZONE_CHANGED" /><action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" /></intent-filter></receiver>' "$MANIFEST"
+            fi
+            mkdir -p "$JAVA_DIR"
+
+            cat > "$JAVA_DIR/WakeNotifyCore.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.annotation.SuppressLint;
+          import android.app.AlarmManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.AudioAttributes;
+          import android.media.RingtoneManager;
+          import android.os.Build;
+          import android.os.PowerManager;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          @SuppressLint({"NewApi", "MissingPermission", "WakelockTimeout", "ApplySharedPref"})
+          @SuppressWarnings("deprecation")
+          public final class WakeNotifyCore {
+              public static final String ACTION_FIRE = "com.mekeirish.remotecontrol.WAKE_NOTIFY_FIRE";
+              public static final String CHANNEL_ID = "wake_alerts";
+              private static final String PREFS = "wake_notify";
+              private static final String KEY = "items";
+              private static final Object LOCK = new Object();
+
+              private WakeNotifyCore() {
+              }
+
+              private static JSONArray readAll(Context c) {
+                  try {
+                      return new JSONArray(c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "[]"));
+                  } catch (Exception e) {
+                      return new JSONArray();
+                  }
+              }
+
+              private static void writeAll(Context c, JSONArray a) {
+                  c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, a.toString()).commit();
+              }
+
+              public static String listJson(Context c) {
+                  synchronized (LOCK) {
+                      return readAll(c).toString();
+                  }
+              }
+
+              private static JSONObject find(Context c, int id) {
+                  JSONArray a = readAll(c);
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o != null && o.optInt("id", -1) == id) return o;
+                  }
+                  return null;
+              }
+
+              private static void drop(Context c, int id) {
+                  JSONArray a = readAll(c);
+                  JSONArray out = new JSONArray();
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o != null && o.optInt("id", -1) != id) out.put(o);
+                  }
+                  writeAll(c, out);
+              }
+
+              private static void upsert(Context c, JSONObject n) {
+                  drop(c, n.optInt("id", -1));
+                  JSONArray a = readAll(c);
+                  a.put(n);
+                  writeAll(c, a);
+              }
+
+              private static int piFlags() {
+                  int f = PendingIntent.FLAG_UPDATE_CURRENT;
+                  if (Build.VERSION.SDK_INT >= 23) f |= PendingIntent.FLAG_IMMUTABLE;
+                  return f;
+              }
+
+              private static PendingIntent firePi(Context c, int id) {
+                  Intent i = new Intent(c, WakeNotifyReceiver.class);
+                  i.setAction(ACTION_FIRE);
+                  i.putExtra("id", id);
+                  return PendingIntent.getBroadcast(c, id, i, piFlags());
+              }
+
+              private static PendingIntent launchPi(Context c, int id) {
+                  Intent i = new Intent(c, MainActivity.class);
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  i.putExtra("wake_notify_id", id);
+                  return PendingIntent.getActivity(c, id, i, piFlags());
+              }
+
+              public static boolean canExact(Context c) {
+                  if (Build.VERSION.SDK_INT < 31) return true;
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  return am != null && am.canScheduleExactAlarms();
+              }
+
+              public static void ensureChannel(Context c) {
+                  if (Build.VERSION.SDK_INT < 26) return;
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null || nm.getNotificationChannel(CHANNEL_ID) != null) return;
+                  NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Alertes", NotificationManager.IMPORTANCE_HIGH);
+                  ch.setDescription("Notifications prioritaires qui reveillent l'appareil");
+                  ch.enableVibration(true);
+                  ch.setVibrationPattern(new long[]{0, 400, 200, 400});
+                  ch.enableLights(true);
+                  ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                          new AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                  .build());
+                  nm.createNotificationChannel(ch);
+              }
+
+              private static void wakeScreen(Context c) {
+                  try {
+                      PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                      if (pm == null) return;
+                      PowerManager.WakeLock wl = pm.newWakeLock(
+                              PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE,
+                              c.getPackageName() + ":wake_notify");
+                      wl.acquire(8000);
+                  } catch (Exception e) {
+                  }
+              }
+
+              public static void show(Context c, int id, String title, String body, boolean wake) {
+                  ensureChannel(c);
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  String t = (title == null) ? "" : title;
+                  String b = (body == null) ? "" : body;
+                  Notification.Builder nb;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nb = new Notification.Builder(c, CHANNEL_ID);
+                  } else {
+                      nb = new Notification.Builder(c);
+                      nb.setPriority(Notification.PRIORITY_HIGH);
+                      nb.setDefaults(Notification.DEFAULT_ALL);
+                  }
+                  nb.setSmallIcon(android.R.drawable.ic_popup_reminder)
+                          .setContentTitle(t)
+                          .setContentText(b)
+                          .setStyle(new Notification.BigTextStyle().bigText(b))
+                          .setAutoCancel(true)
+                          .setCategory(Notification.CATEGORY_REMINDER)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC)
+                          .setWhen(System.currentTimeMillis())
+                          .setContentIntent(launchPi(c, id));
+                  if (wake) nb.setFullScreenIntent(launchPi(c, id), true);
+                  nm.notify(id, nb.build());
+                  if (wake) wakeScreen(c);
+              }
+
+              public static boolean arm(Context c, JSONObject o) {
+                  try {
+                      int id = o.getInt("id");
+                      long at = o.getLong("at");
+                      boolean clock = o.optBoolean("clock", true);
+                      AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                      if (am == null) return false;
+                      PendingIntent pi = firePi(c, id);
+                      if (canExact(c)) {
+                          try {
+                              if (clock) {
+                                  am.setAlarmClock(new AlarmManager.AlarmClockInfo(at, launchPi(c, id)), pi);
+                              } else if (Build.VERSION.SDK_INT >= 23) {
+                                  am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+                              } else {
+                                  am.setExact(AlarmManager.RTC_WAKEUP, at, pi);
+                              }
+                              return true;
+                          } catch (SecurityException se) {
+                          }
+                      }
+                      if (Build.VERSION.SDK_INT >= 23) {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi);
+                      } else {
+                          am.set(AlarmManager.RTC_WAKEUP, at, pi);
+                      }
+                      return false;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              public static boolean schedule(Context c, int id, String title, String body, long at, long repeatMs, boolean clock) throws Exception {
+                  JSONObject n = new JSONObject();
+                  n.put("id", id);
+                  n.put("title", title);
+                  n.put("body", body);
+                  n.put("at", at);
+                  n.put("repeat", repeatMs);
+                  n.put("clock", clock);
+                  synchronized (LOCK) {
+                      upsert(c, n);
+                  }
+                  return arm(c, n);
+              }
+
+              public static void cancel(Context c, int id) {
+                  synchronized (LOCK) {
+                      AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                      if (am != null) am.cancel(firePi(c, id));
+                      drop(c, id);
+                  }
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm != null) nm.cancel(id);
+              }
+
+              public static void cancelAll(Context c) {
+                  JSONArray a;
+                  synchronized (LOCK) {
+                      a = readAll(c);
+                  }
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o != null) cancel(c, o.optInt("id", -1));
+                  }
+              }
+
+              public static void fire(Context c, int id) {
+                  JSONObject o;
+                  synchronized (LOCK) {
+                      o = find(c, id);
+                  }
+                  if (o == null) return;
+                  show(c, id, o.optString("title", ""), o.optString("body", ""), true);
+                  long rep = o.optLong("repeat", 0);
+                  if (rep > 0) {
+                      try {
+                          long now = System.currentTimeMillis();
+                          long next = o.optLong("at", now) + rep;
+                          if (next <= now) next += ((now - next) / rep + 1) * rep;
+                          o.put("at", next);
+                          synchronized (LOCK) {
+                              upsert(c, o);
+                          }
+                          arm(c, o);
+                      } catch (Exception e) {
+                      }
+                  } else {
+                      synchronized (LOCK) {
+                          drop(c, id);
+                      }
+                  }
+              }
+
+              public static void rearmAll(Context c) {
+                  JSONArray a;
+                  synchronized (LOCK) {
+                      a = readAll(c);
+                  }
+                  long now = System.currentTimeMillis();
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o == null) continue;
+                      int id = o.optInt("id", -1);
+                      long at = o.optLong("at", 0);
+                      long rep = o.optLong("repeat", 0);
+                      if (at <= now) {
+                          if (rep > 0) {
+                              try {
+                                  o.put("at", at + ((now - at) / rep + 1) * rep);
+                                  synchronized (LOCK) {
+                                      upsert(c, o);
+                                  }
+                                  arm(c, o);
+                              } catch (Exception e) {
+                              }
+                          } else {
+                              show(c, id, o.optString("title", ""), o.optString("body", ""), true);
+                              synchronized (LOCK) {
+                                  drop(c, id);
+                              }
+                          }
+                      } else {
+                          arm(c, o);
+                      }
+                  }
+              }
+          }
+          JAVAEOF
+
+            cat > "$JAVA_DIR/WakeNotifyReceiver.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class WakeNotifyReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (intent == null) return;
+                  if (WakeNotifyCore.ACTION_FIRE.equals(intent.getAction())) {
+                      WakeNotifyCore.fire(context, intent.getIntExtra("id", -1));
+                  } else {
+                      WakeNotifyCore.rearmAll(context);
+                  }
+              }
+          }
+          JAVAEOF
+
+            cat > "$JAVA_DIR/WakeNotifyPlugin.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.annotation.SuppressLint;
+          import android.app.NotificationManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.PowerManager;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.app.NotificationManagerCompat;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @SuppressLint("NewApi")
+          @CapacitorPlugin(name = "WakeNotify")
+          public class WakeNotifyPlugin extends Plugin {
+              private static volatile int launchId = -1;
+
+              private static int grab(Intent i) {
+                  if (i == null) return -1;
+                  int id = i.getIntExtra("wake_notify_id", -1);
+                  if (id != -1) {
+                      launchId = id;
+                      i.removeExtra("wake_notify_id");
+                  }
+                  return id;
+              }
+
+              @Override
+              public void load() {
+                  Context c = getContext();
+                  WakeNotifyCore.ensureChannel(c);
+                  WakeNotifyCore.rearmAll(c);
+                  if (getActivity() != null) grab(getActivity().getIntent());
+              }
+
+              @Override
+              protected void handleOnNewIntent(Intent intent) {
+                  super.handleOnNewIntent(intent);
+                  int id = grab(intent);
+                  if (id != -1) {
+                      JSObject o = new JSObject();
+                      o.put("id", id);
+                      notifyListeners("notificationTapped", o, true);
+                  }
+              }
+
+              private JSObject buildStatus() {
+                  Context c = getContext();
+                  JSObject o = new JSObject();
+                  o.put("sdk", Build.VERSION.SDK_INT);
+                  o.put("notifications", NotificationManagerCompat.from(c).areNotificationsEnabled());
+                  o.put("exactAlarms", WakeNotifyCore.canExact(c));
+                  boolean fs = true;
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      try {
+                          NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                          fs = (Boolean) nm.getClass().getMethod("canUseFullScreenIntent").invoke(nm);
+                      } catch (Exception e) {
+                          fs = true;
+                      }
+                  }
+                  o.put("fullScreen", fs);
+                  boolean bat = false;
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                      bat = pm != null && pm.isIgnoringBatteryOptimizations(c.getPackageName());
+                  }
+                  o.put("batteryExempt", bat);
+                  return o;
+              }
+
+              @PluginMethod
+              public void schedule(PluginCall call) {
+                  try {
+                      Integer idObj = call.getInt("id");
+                      int id = (idObj != null) ? idObj.intValue() : (int) (System.currentTimeMillis() % 2000000000L);
+                      Double at = call.getDouble("at");
+                      if (at == null) {
+                          call.reject("Parametre at manquant");
+                          return;
+                      }
+                      long when = at.longValue();
+                      long min = System.currentTimeMillis() + 1000;
+                      if (when < min) when = min;
+                      long rep = call.getDouble("repeatMs", 0.0).longValue();
+                      if (rep > 0 && rep < 60000) rep = 60000;
+                      boolean clock = call.getBoolean("alarmClock", true);
+                      boolean exact = WakeNotifyCore.schedule(getContext(), id, call.getString("title", ""), call.getString("body", ""), when, rep, clock);
+                      JSObject r = new JSObject();
+                      r.put("id", id);
+                      r.put("at", when);
+                      r.put("exact", exact);
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      call.reject("Echec : " + e.getMessage());
+                  }
+              }
+
+              @PluginMethod
+              public void show(PluginCall call) {
+                  Integer idObj = call.getInt("id");
+                  int id = (idObj != null) ? idObj.intValue() : (int) (System.currentTimeMillis() % 2000000000L);
+                  WakeNotifyCore.show(getContext(), id, call.getString("title", ""), call.getString("body", ""), call.getBoolean("wake", false));
+                  JSObject r = new JSObject();
+                  r.put("id", id);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void cancel(PluginCall call) {
+                  Integer idObj = call.getInt("id");
+                  if (idObj == null) {
+                      call.reject("Parametre id manquant");
+                      return;
+                  }
+                  WakeNotifyCore.cancel(getContext(), idObj.intValue());
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void cancelAll(PluginCall call) {
+                  WakeNotifyCore.cancelAll(getContext());
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void list(PluginCall call) {
+                  try {
+                      JSObject r = new JSObject();
+                      r.put("items", new JSArray(WakeNotifyCore.listJson(getContext())));
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      call.reject("Lecture impossible");
+                  }
+              }
+
+              @PluginMethod
+              public void status(PluginCall call) {
+                  call.resolve(buildStatus());
+              }
+
+              @PluginMethod
+              public void requestNotifPermission(PluginCall call) {
+                  Context c = getContext();
+                  if (Build.VERSION.SDK_INT >= 33 && !NotificationManagerCompat.from(c).areNotificationsEnabled() && getActivity() != null) {
+                      ActivityCompat.requestPermissions(getActivity(), new String[]{"android.permission.POST_NOTIFICATIONS"}, 4242);
+                  }
+                  call.resolve(buildStatus());
+              }
+
+              @PluginMethod
+              public void getLaunch(PluginCall call) {
+                  JSObject o = new JSObject();
+                  o.put("id", launchId);
+                  launchId = -1;
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void openSettings(PluginCall call) {
+                  String type = call.getString("type", "app");
+                  Context c = getContext();
+                  String pkg = c.getPackageName();
+                  Intent i;
+                  if ("exact".equals(type) && Build.VERSION.SDK_INT >= 31) {
+                      i = new Intent("android.settings.REQUEST_SCHEDULE_EXACT_ALARM", Uri.parse("package:" + pkg));
+                  } else if ("fullscreen".equals(type) && Build.VERSION.SDK_INT >= 34) {
+                      i = new Intent("android.settings.MANAGE_APP_USE_FULL_SCREEN_INTENT", Uri.parse("package:" + pkg));
+                  } else if ("battery".equals(type) && Build.VERSION.SDK_INT >= 23) {
+                      i = new Intent("android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", Uri.parse("package:" + pkg));
+                  } else if ("notifications".equals(type) && Build.VERSION.SDK_INT >= 26) {
+                      i = new Intent("android.settings.APP_NOTIFICATION_SETTINGS");
+                      i.putExtra("android.provider.extra.APP_PACKAGE", pkg);
+                  } else {
+                      i = new Intent("android.settings.APPLICATION_DETAILS_SETTINGS", Uri.parse("package:" + pkg));
+                  }
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  try {
+                      c.startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      try {
+                          Intent d = new Intent("android.settings.APPLICATION_DETAILS_SETTINGS", Uri.parse("package:" + pkg));
+                          d.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          c.startActivity(d);
+                          call.resolve();
+                      } catch (Exception e2) {
+                          call.reject("Ouverture impossible");
+                      }
+                  }
+              }
+          }
+          JAVAEOF
+
+            if ! grep -q "WakeNotifyPlugin" "$JAVA_DIR/MainActivity.java"; then
+              sed -i 's/super.onCreate(savedInstanceState);/registerPlugin(WakeNotifyPlugin.class);\n        super.onCreate(savedInstanceState);/' "$JAVA_DIR/MainActivity.java"
+            fi
+
+            cat > www/wakenotify.js << 'WAKEEOF'
+          (function () {
+            var C = window.Capacitor;
+            var P = C && C.Plugins && C.Plugins.WakeNotify;
+            if (!P) { console.log('WakeNotify : plugin indisponible'); return; }
+            var perm = 'default';
+            var asked = false;
+            var live = {};
+
+            function toId(tag) {
+              if (tag === undefined || tag === null || tag === '') {
+                return Math.floor(Math.random() * 2000000000) + 1;
+              }
+              var s = String(tag);
+              var h = 0;
+              for (var i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+              return (Math.abs(h) % 2000000000) + 1;
+            }
+            function toTime(v) {
+              if (v instanceof Date) return v.getTime();
+              var n = Number(v);
+              return isNaN(n) ? 0 : n;
+            }
+            function refresh() {
+              return P.status().then(function (s) {
+                if (s.notifications) perm = 'granted';
+                else perm = asked ? 'denied' : 'default';
+                return s;
+              }).catch(function () { return {}; });
+            }
+            function tapped(id) {
+              var n = live[id];
+              if (n && typeof n.onclick === 'function') { try { n.onclick({ target: n }); } catch (e) {} }
+              try { window.dispatchEvent(new CustomEvent('wakenotify:tap', { detail: { id: id } })); } catch (e2) {}
+            }
+
+            function N(title, options) {
+              options = options || {};
+              var id = toId(options.tag);
+              var at = 0;
+              if (options.at !== undefined && options.at !== null) at = toTime(options.at);
+              else if (options.showTrigger && options.showTrigger.timestamp) at = toTime(options.showTrigger.timestamp);
+              this.title = title;
+              this.body = options.body || '';
+              this.tag = options.tag;
+              this.onclick = null;
+              this.close = function () { P.cancel({ id: id }).catch(function () {}); };
+              live[id] = this;
+              if (at > Date.now() + 1000) {
+                api.schedule({ id: id, title: title, body: options.body, at: at, repeatMs: options.repeatMs }).catch(function () {});
+              } else {
+                P.show({ id: id, title: String(title || ''), body: String(options.body || ''), wake: options.wake === true }).catch(function () {});
+              }
+            }
+            N.requestPermission = function (cb) {
+              asked = true;
+              return P.requestNotifPermission().then(function (s) {
+                if (s && s.notifications) return 'granted';
+                return new Promise(function (resolve) {
+                  var n = 0;
+                  var t = setInterval(function () {
+                    n++;
+                    P.status().then(function (s2) {
+                      if (s2.notifications) { clearInterval(t); resolve('granted'); }
+                      else if (n >= 40) { clearInterval(t); resolve('denied'); }
+                    }).catch(function () {});
+                  }, 750);
+                });
+              }).catch(function () { return 'denied'; }).then(function (r) {
+                perm = r;
+                if (typeof cb === 'function') cb(r);
+                return r;
+              });
+            };
+            Object.defineProperty(N, 'permission', { get: function () { return perm; } });
+
+            var api = {
+              schedule: function (o) {
+                o = o || {};
+                return P.schedule({
+                  id: (o.id !== undefined && o.id !== null) ? o.id : toId(o.tag),
+                  title: String(o.title || ''),
+                  body: String(o.body || ''),
+                  at: toTime(o.at),
+                  repeatMs: Number(o.repeatMs || 0),
+                  alarmClock: o.alarmClock !== false
+                });
+              },
+              show: function (o) {
+                o = o || {};
+                return P.show({
+                  id: (o.id !== undefined && o.id !== null) ? o.id : toId(o.tag),
+                  title: String(o.title || ''),
+                  body: String(o.body || ''),
+                  wake: o.wake === true
+                });
+              },
+              cancel: function (id) { return P.cancel({ id: id }); },
+              cancelAll: function () { return P.cancelAll(); },
+              list: function () { return P.list(); },
+              status: function () { return P.status(); },
+              requestPermission: function () { return N.requestPermission(); },
+              openSettings: function (type) { return P.openSettings({ type: type || 'app' }); }
+            };
+
+            window.Notification = N;
+            window.WakeNotify = api;
+            try {
+              if (window.ServiceWorkerRegistration && ServiceWorkerRegistration.prototype) {
+                ServiceWorkerRegistration.prototype.showNotification = function (title, options) {
+                  new N(title, options);
+                  return Promise.resolve();
+                };
+              }
+            } catch (e) {}
+
+            P.addListener('notificationTapped', function (e) { tapped(e.id); });
+            P.getLaunch().then(function (r) {
+              if (r && r.id > 0) setTimeout(function () { tapped(r.id); }, 500);
+            }).catch(function () {});
+            refresh();
+            console.log('WakeNotify : actif');
+          })();
+          WAKEEOF
+
+            cat > wake-inject.js << 'NODEEOF'
+          var fs = require('fs');
+          var h = process.argv[2];
+          var c = fs.readFileSync(h, 'utf8');
+          if (c.indexOf('wakenotify.js') === -1) {
+            var tag = '<script src="wakenotify.js"><' + '/script>' + String.fromCharCode(10);
+            var i = Math.max(c.lastIndexOf('</body>'), c.lastIndexOf('</BODY>'));
+            c = (i >= 0) ? c.slice(0, i) + tag + c.slice(i) : c + String.fromCharCode(10) + tag;
+            fs.writeFileSync(h, c, 'utf8');
+          }
+          NODEEOF
+            MAIN_HTML=$(cd www && find . -maxdepth 1 -name "*.html" | head -n 1)
+            if [ -n "$MAIN_HTML" ]; then
+              node wake-inject.js "www/$MAIN_HTML"
+            fi
+            rm -f wake-inject.js
+
+            if ! grep -q "registerPlugin(WakeNotifyPlugin.class)" "$JAVA_DIR/MainActivity.java"; then echo "ERREUR : WakeNotify non enregistre"; exit 1; fi
+            if [ ! -f "$JAVA_DIR/WakeNotifyCore.java" ] || [ ! -f www/wakenotify.js ]; then echo "ERREUR : WakeNotify non injecte"; exit 1; fi
+            npx cap sync android
+          else
+            echo "Pas de notification detectee"
+          fi
+
+      - name: 📲 Proprietes d'application native (NativeKit)
+        run: |
+          cd capacitor-app
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          JAVA_DIR="android/app/src/main/java/com/mekeirish/remotecontrol"
+          mkdir -p "$JAVA_DIR"
+
+          cat > "$JAVA_DIR/NativeKitPlugin.java" << 'JAVAEOF'
+          package com.mekeirish.remotecontrol;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ActivityInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.ShortcutInfo;
+          import android.content.pm.ShortcutManager;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Icon;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.view.View;
+          import android.view.Window;
+          import android.view.WindowInsets;
+          import android.view.WindowInsetsController;
+          import android.view.WindowManager;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+          import org.json.JSONObject;
+
+          @SuppressLint({"NewApi", "SourceLockedOrientationActivity"})
+          @SuppressWarnings("deprecation")
+          @CapacitorPlugin(name = "NativeKit")
+          public class NativeKitPlugin extends Plugin {
+              private static volatile String launchUrl = null;
+              private static volatile String launchText = null;
+              private static volatile String launchShortcut = null;
+
+              private static boolean grab(Intent i) {
+                  if (i == null) return false;
+                  boolean found = false;
+                  String sc = i.getStringExtra("nk_url");
+                  if (sc != null) {
+                      launchShortcut = sc;
+                      i.removeExtra("nk_url");
+                      i.setAction(Intent.ACTION_MAIN);
+                      return true;
+                  }
+                  String action = i.getAction();
+                  if (Intent.ACTION_SEND.equals(action)) {
+                      CharSequence t = i.getCharSequenceExtra(Intent.EXTRA_TEXT);
+                      if (t == null) t = i.getCharSequenceExtra(Intent.EXTRA_SUBJECT);
+                      if (t != null) {
+                          launchText = t.toString();
+                          found = true;
+                      }
+                      i.removeExtra(Intent.EXTRA_TEXT);
+                      i.setAction(Intent.ACTION_MAIN);
+                  } else if (Intent.ACTION_VIEW.equals(action) && i.getData() != null) {
+                      launchUrl = i.getData().toString();
+                      i.setData(null);
+                      i.setAction(Intent.ACTION_MAIN);
+                      found = true;
+                  }
+                  return found;
+              }
+
+              private static JSObject takeLaunch() {
+                  JSObject o = new JSObject();
+                  if (launchUrl != null) o.put("url", launchUrl);
+                  if (launchText != null) o.put("text", launchText);
+                  if (launchShortcut != null) o.put("shortcut", launchShortcut);
+                  launchUrl = null;
+                  launchText = null;
+                  launchShortcut = null;
+                  return o;
+              }
+
+              private static Integer parseColor(String s) {
+                  if (s == null) return null;
+                  String t = s.trim();
+                  if (t.length() == 4 && t.charAt(0) == '#') {
+                      t = "#" + t.charAt(1) + t.charAt(1) + t.charAt(2) + t.charAt(2) + t.charAt(3) + t.charAt(3);
+                  }
+                  try {
+                      return Integer.valueOf(Color.parseColor(t));
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private void ui(Runnable r) {
+                  Activity a = getActivity();
+                  if (a != null) a.runOnUiThread(r);
+              }
+
+              private String folder() {
+                  try {
+                      String l = getContext().getApplicationInfo().loadLabel(getContext().getPackageManager()).toString().replaceAll("[^A-Za-z0-9._ -]", "_").trim();
+                      if (l.length() > 0) return l;
+                  } catch (Exception e) {
+                  }
+                  return "App";
+              }
+
+              private void toastNow(final String text, final boolean longDuration) {
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          Toast.makeText(getContext(), text, longDuration ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+                      }
+                  });
+              }
+
+              @Override
+              public void load() {
+                  Activity a = getActivity();
+                  if (a == null) return;
+                  grab(a.getIntent());
+                  a.runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              WebView wv = getBridge().getWebView();
+                              WebSettings s = wv.getSettings();
+                              s.setSupportZoom(false);
+                              s.setBuiltInZoomControls(false);
+                              s.setDisplayZoomControls(false);
+                              s.setTextZoom(100);
+                              wv.setOverScrollMode(View.OVER_SCROLL_NEVER);
+                          } catch (Exception e) {
+                          }
+                      }
+                  });
+              }
+
+              @Override
+              protected void handleOnNewIntent(Intent intent) {
+                  super.handleOnNewIntent(intent);
+                  if (grab(intent)) notifyListeners("appIntent", takeLaunch(), true);
+              }
+
+              @PluginMethod
+              public void getLaunch(PluginCall call) {
+                  call.resolve(takeLaunch());
+              }
+
+              @PluginMethod
+              public void setBars(final PluginCall call) {
+                  Integer parsed = parseColor(call.getString("color"));
+                  if (parsed == null) {
+                      call.reject("Couleur invalide");
+                      return;
+                  }
+                  final int col = parsed.intValue();
+                  double lum = (0.299 * Color.red(col) + 0.587 * Color.green(col) + 0.114 * Color.blue(col)) / 255.0;
+                  boolean lightTmp = lum > 0.6;
+                  Boolean dk = call.getBoolean("dark");
+                  if (dk != null) lightTmp = !dk.booleanValue();
+                  final boolean light = lightTmp;
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Window w = getActivity().getWindow();
+                              w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+                              w.setStatusBarColor(col);
+                              w.setNavigationBarColor(col);
+                              w.setBackgroundDrawable(new ColorDrawable(col));
+                              if (Build.VERSION.SDK_INT >= 30) {
+                                  WindowInsetsController ic = w.getInsetsController();
+                                  if (ic != null) {
+                                      int m = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                                      ic.setSystemBarsAppearance(light ? m : 0, m);
+                                  }
+                              } else if (Build.VERSION.SDK_INT >= 23) {
+                                  View d = w.getDecorView();
+                                  int f = d.getSystemUiVisibility();
+                                  if (light) f |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR; else f &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                                  if (Build.VERSION.SDK_INT >= 26) {
+                                      if (light) f |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR; else f &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                                  }
+                                  d.setSystemUiVisibility(f);
+                              }
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void setImmersive(final PluginCall call) {
+                  final boolean on = call.getBoolean("enabled", true);
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Window w = getActivity().getWindow();
+                              if (Build.VERSION.SDK_INT >= 30) {
+                                  WindowInsetsController ic = w.getInsetsController();
+                                  if (ic != null) {
+                                      if (on) {
+                                          ic.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                                          ic.hide(WindowInsets.Type.systemBars());
+                                      } else {
+                                          ic.show(WindowInsets.Type.systemBars());
+                                      }
+                                  }
+                              } else {
+                                  View d = w.getDecorView();
+                                  int f = d.getSystemUiVisibility();
+                                  int m = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_FULLSCREEN;
+                                  if (on) f |= m; else f &= ~m;
+                                  d.setSystemUiVisibility(f);
+                              }
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void keepAwake(final PluginCall call) {
+                  final boolean on = call.getBoolean("enabled", true);
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Window w = getActivity().getWindow();
+                              if (on) w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); else w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void secure(final PluginCall call) {
+                  final boolean on = call.getBoolean("enabled", true);
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Window w = getActivity().getWindow();
+                              if (on) w.addFlags(WindowManager.LayoutParams.FLAG_SECURE); else w.clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void setBrightness(final PluginCall call) {
+                  Double d = call.getDouble("value");
+                  final float v = (d == null || d.doubleValue() < 0) ? WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE : (float) Math.min(1.0, d.doubleValue());
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Window w = getActivity().getWindow();
+                              WindowManager.LayoutParams lp = w.getAttributes();
+                              lp.screenBrightness = v;
+                              w.setAttributes(lp);
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void setOrientation(final PluginCall call) {
+                  String o = call.getString("orientation", "any");
+                  int v;
+                  if ("portrait-primary".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+                  else if ("portrait-secondary".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+                  else if ("portrait".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT;
+                  else if ("landscape-primary".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+                  else if ("landscape-secondary".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+                  else if ("landscape".equals(o)) v = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+                  else v = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+                  final int mode = v;
+                  ui(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              getActivity().setRequestedOrientation(mode);
+                          } catch (Exception e) {
+                          }
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void toast(PluginCall call) {
+                  toastNow(call.getString("text", ""), call.getBoolean("longDuration", false));
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void share(PluginCall call) {
+                  try {
+                      String title = call.getString("title", "");
+                      String text = call.getString("text", "");
+                      String url = call.getString("url", "");
+                      String nl = String.valueOf((char) 10);
+                      String body = text;
+                      if (url.length() > 0) body = (body.length() > 0) ? (body + nl + url) : url;
+                      if (body.length() == 0 && title.length() == 0) {
+                          call.reject("Rien a partager");
+                          return;
+                      }
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      if (title.length() > 0) i.putExtra(Intent.EXTRA_SUBJECT, title);
+                      i.putExtra(Intent.EXTRA_TEXT, body.length() > 0 ? body : title);
+                      Intent ch = Intent.createChooser(i, title.length() > 0 ? title : null);
+                      Activity a = getActivity();
+                      if (a != null) {
+                          a.startActivity(ch);
+                      } else {
+                          ch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          getContext().startActivity(ch);
+                      }
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("Partage impossible");
+                  }
+              }
+
+              @PluginMethod
+              public void openUrl(PluginCall call) {
+                  try {
+                      String url = call.getString("url");
+                      if (url == null) {
+                          call.reject("URL manquante");
+                          return;
+                      }
+                      Uri u = Uri.parse(url.trim());
+                      String sc = u.getScheme();
+                      if (sc == null) {
+                          call.reject("URL invalide");
+                          return;
+                      }
+                      sc = sc.toLowerCase();
+                      if (!(sc.equals("http") || sc.equals("https") || sc.equals("mailto") || sc.equals("tel") || sc.equals("sms") || sc.equals("smsto") || sc.equals("geo"))) {
+                          call.reject("Protocole refuse");
+                          return;
+                      }
+                      Intent i = new Intent(Intent.ACTION_VIEW, u);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("Ouverture impossible");
+                  }
+              }
+
+              @PluginMethod
+              public void saveFile(final PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 29) {
+                      call.reject("Android 10 minimum requis");
+                      return;
+                  }
+                  final String name = call.getString("name", "download").replaceAll("[^A-Za-z0-9._-]", "_");
+                  final String data = call.getString("data");
+                  final String mime = call.getString("mime", "application/octet-stream");
+                  if (data == null) {
+                      call.reject("Aucune donnee");
+                      return;
+                  }
+                  final String dir = folder();
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              byte[] bytes = Base64.decode(data, Base64.DEFAULT);
+                              ContentResolver cr = getContext().getContentResolver();
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                              v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                              v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + dir);
+                              v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                              Uri uri = cr.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                              if (uri == null) throw new Exception("Insertion impossible");
+                              OutputStream out = cr.openOutputStream(uri);
+                              if (out == null) throw new Exception("Ecriture impossible");
+                              out.write(bytes);
+                              out.close();
+                              ContentValues done = new ContentValues();
+                              done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                              cr.update(uri, done, null, null);
+                              toastNow("Enregistre dans Telechargements/" + dir, true);
+                              JSObject r = new JSObject();
+                              r.put("uri", uri.toString());
+                              call.resolve(r);
+                          } catch (Exception e) {
+                              call.reject("Echec : " + e.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+
+              @PluginMethod
+              public void setShortcuts(PluginCall call) {
+                  if (Build.VERSION.SDK_INT < 25) {
+                      call.resolve();
+                      return;
+                  }
+                  try {
+                      JSArray items = call.getArray("items");
+                      Context c = getContext();
+                      ShortcutManager sm = (ShortcutManager) c.getSystemService(Context.SHORTCUT_SERVICE);
+                      if (items == null || sm == null) {
+                          call.resolve();
+                          return;
+                      }
+                      List<ShortcutInfo> list = new ArrayList<>();
+                      int max = Math.min(4, sm.getMaxShortcutCountPerActivity());
+                      int icon = c.getApplicationInfo().icon;
+                      for (int k = 0; k < items.length() && list.size() < max; k++) {
+                          JSONObject o = items.getJSONObject(k);
+                          String label = o.optString("label", "").trim();
+                          if (label.length() == 0) continue;
+                          Intent in = new Intent(c, MainActivity.class);
+                          in.setAction(Intent.ACTION_VIEW);
+                          in.putExtra("nk_url", o.optString("url", "/"));
+                          in.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                          ShortcutInfo.Builder b = new ShortcutInfo.Builder(c, o.optString("id", "sc" + k))
+                                  .setShortLabel(label)
+                                  .setLongLabel(label)
+                                  .setIntent(in);
+                          if (icon != 0) b.setIcon(Icon.createWithResource(c, icon));
+                          list.add(b.build());
+                      }
+                      sm.setDynamicShortcuts(list);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("Raccourcis impossibles");
+                  }
+              }
+
+              @PluginMethod
+              public void info(PluginCall call) {
+                  JSObject o = new JSObject();
+                  Context c = getContext();
+                  o.put("sdk", Build.VERSION.SDK_INT);
+                  o.put("manufacturer", Build.MANUFACTURER);
+                  o.put("model", Build.MODEL);
+                  o.put("brand", Build.BRAND);
+                  o.put("package", c.getPackageName());
+                  try {
+                      PackageInfo pi = c.getPackageManager().getPackageInfo(c.getPackageName(), 0);
+                      o.put("versionName", pi.versionName);
+                      long vc = (Build.VERSION.SDK_INT >= 28) ? pi.getLongVersionCode() : pi.versionCode;
+                      o.put("versionCode", vc);
+                  } catch (Exception e) {
+                  }
+                  call.resolve(o);
+              }
+
+              @PluginMethod
+              public void minimize(PluginCall call) {
+                  Activity a = getActivity();
+                  if (a != null) a.moveTaskToBack(true);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void exit(PluginCall call) {
+                  Activity a = getActivity();
+                  call.resolve();
+                  if (a != null) a.finishAffinity();
+              }
+          }
+          JAVAEOF
+
+          if ! grep -q "NativeKitPlugin" "$JAVA_DIR/MainActivity.java"; then
+            sed -i 's/super.onCreate(savedInstanceState);/registerPlugin(NativeKitPlugin.class);\n        super.onCreate(savedInstanceState);/' "$JAVA_DIR/MainActivity.java"
+          fi
+
+          cat > www/nativekit.js << 'JSEOF'
+          (function () {
+            if (window.NativeKit) return;
+            var noop = function () {};
+            var lastColor = '';
+
+            function plugin() {
+              var C = window.Capacitor;
+              return C && C.Plugins && C.Plugins.NativeKit ? C.Plugins.NativeKit : null;
+            }
+            function call(name, arg) {
+              var p = plugin();
+              if (!p || typeof p[name] !== 'function') return Promise.reject(new Error('NativeKit indisponible'));
+              return p[name](arg || {});
+            }
+            function emit(name, detail) {
+              try { window.dispatchEvent(new CustomEvent(name, { detail: detail })); } catch (e) {}
+            }
+
+            try {
+              var st = document.createElement('style');
+              st.setAttribute('data-nativekit', '1');
+              st.textContent = ':where(html,body){overscroll-behavior:none}'
+                + ':where(*){-webkit-tap-highlight-color:transparent}'
+                + ':where(img){-webkit-user-drag:none}'
+                + ':where(button,a,input,select,textarea,label,summary,[role=button]){touch-action:manipulation}';
+              (document.head || document.documentElement).appendChild(st);
+            } catch (e) {}
+
+            try {
+              var mm = window.matchMedia.bind(window);
+              window.matchMedia = function (q) {
+                var s = String(q);
+                if (s.indexOf('display-mode') === -1) return mm(q);
+                var norm = s.split(' ').join('').toLowerCase();
+                if (norm.indexOf('and') !== -1 || norm.indexOf(',') !== -1) return mm(q);
+                var r = mm(norm === '(display-mode:standalone)' ? 'all' : 'not all');
+                try { Object.defineProperty(r, 'media', { value: s }); } catch (e1) {}
+                return r;
+              };
+              Object.defineProperty(navigator, 'standalone', { value: true, configurable: true });
+            } catch (e) {}
+
+            function toBase64(url) {
+              return fetch(url).then(function (r) { return r.blob(); }).then(function (b) {
+                return new Promise(function (resolve, reject) {
+                  var fr = new FileReader();
+                  fr.onload = function () {
+                    var s = String(fr.result);
+                    resolve({ data: s.slice(s.indexOf(',') + 1), mime: b.type || 'application/octet-stream' });
+                  };
+                  fr.onerror = function () { reject(fr.error); };
+                  fr.readAsDataURL(b);
+                });
+              });
+            }
+            function handleDownload(a) {
+              try {
+                if (!a || !a.hasAttribute || !a.hasAttribute('download')) return false;
+                var href = a.href || '';
+                if (href.indexOf('blob:') !== 0 && href.indexOf('data:') !== 0) return false;
+                if (!plugin()) return false;
+                var name = a.getAttribute('download') || 'download';
+                toBase64(href).then(function (r) {
+                  return call('saveFile', { name: name, data: r.data, mime: r.mime });
+                }).catch(function () {
+                  call('toast', { text: 'Echec du telechargement' }).catch(noop);
+                });
+                return true;
+              } catch (e) { return false; }
+            }
+            try {
+              var origClick = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function () {
+                if (handleDownload(this)) return;
+                return origClick.apply(this, arguments);
+              };
+              document.addEventListener('click', function (e) {
+                var t = e.target;
+                while (t && t.tagName !== 'A') t = t.parentNode;
+                if (t && handleDownload(t)) { e.preventDefault(); e.stopPropagation(); }
+              }, true);
+            } catch (e) {}
+
+            try {
+              var origOpen = window.open;
+              window.open = function (url, target, features) {
+                try {
+                  if (url && plugin()) {
+                    var u = new URL(String(url), location.href);
+                    var ok = /^(https?|mailto|tel|sms|geo):/.test(u.protocol + '');
+                    if (ok && (u.origin !== location.origin || u.protocol !== location.protocol)) {
+                      call('openUrl', { url: u.href }).catch(noop);
+                      return null;
+                    }
+                  }
+                } catch (e1) {}
+                return origOpen.apply(window, arguments);
+              };
+            } catch (e) {}
+
+            try {
+              navigator.share = function (d) {
+                d = d || {};
+                if (d.files && d.files.length) return Promise.reject(new Error('Partage de fichiers non supporte'));
+                return call('share', { title: d.title || '', text: d.text || '', url: d.url || '' });
+              };
+              navigator.canShare = function (d) { return !(d && d.files && d.files.length); };
+            } catch (e) {}
+
+            try {
+              if (window.screen && screen.orientation) {
+                screen.orientation.lock = function (o) { return call('setOrientation', { orientation: String(o) }); };
+                screen.orientation.unlock = function () { call('setOrientation', { orientation: 'any' }).catch(noop); };
+              }
+            } catch (e) {}
+
+            try {
+              var locks = 0;
+              var wl = {
+                request: function (type) {
+                  if (type && type !== 'screen') return Promise.reject(new Error('Type non supporte'));
+                  return call('keepAwake', { enabled: true }).then(function () {
+                    locks++;
+                    var s = {
+                      type: 'screen', released: false, onrelease: null,
+                      release: function () {
+                        if (s.released) return Promise.resolve();
+                        s.released = true;
+                        locks--;
+                        var p = locks > 0 ? Promise.resolve() : call('keepAwake', { enabled: false });
+                        if (typeof s.onrelease === 'function') { try { s.onrelease(); } catch (e2) {} }
+                        return p;
+                      },
+                      addEventListener: noop,
+                      removeEventListener: noop
+                    };
+                    return s;
+                  });
+                }
+              };
+              Object.defineProperty(navigator, 'wakeLock', { value: wl, configurable: true });
+            } catch (e) {}
+
+            try {
+              var fsEl = null;
+              var fireFs = function () { try { document.dispatchEvent(new Event('fullscreenchange')); } catch (e3) {} };
+              Element.prototype.requestFullscreen = function () {
+                fsEl = this;
+                return call('setImmersive', { enabled: true }).then(fireFs);
+              };
+              document.exitFullscreen = function () {
+                fsEl = null;
+                return call('setImmersive', { enabled: false }).then(fireFs);
+              };
+              Object.defineProperty(document, 'fullscreenElement', { get: function () { return fsEl; }, configurable: true });
+              Object.defineProperty(document, 'fullscreenEnabled', { get: function () { return true; }, configurable: true });
+            } catch (e) {}
+
+            function applyTheme() {
+              var ms = document.querySelectorAll('meta[name="theme-color"]');
+              var color = '';
+              for (var i = 0; i < ms.length; i++) {
+                var med = ms[i].getAttribute('media');
+                var c = ms[i].getAttribute('content');
+                if (!c) continue;
+                if (med) { try { if (!window.matchMedia(med).matches) continue; } catch (e4) {} }
+                color = c;
+                break;
+              }
+              if (color && color !== lastColor) {
+                lastColor = color;
+                call('setBars', { color: color }).catch(function () { lastColor = ''; });
+              }
+            }
+
+            function loadShortcuts() {
+              var l = document.querySelector('link[rel="manifest"]');
+              var href = l ? l.href : (location.origin + '/manifest.json');
+              fetch(href).then(function (r) { return r.json(); }).then(function (m) {
+                var src = (m && m.shortcuts) ? m.shortcuts : [];
+                var items = [];
+                for (var i = 0; i < src.length && items.length < 4; i++) {
+                  var label = String(src[i].short_name || src[i].name || '');
+                  if (!label) continue;
+                  items.push({ id: 'sc' + i, label: label, url: String(src[i].url || '/') });
+                }
+                if (items.length) call('setShortcuts', { items: items }).catch(noop);
+              }).catch(noop);
+            }
+
+            function sameOriginNavigate(path) {
+              try {
+                var u = new URL(String(path), location.href);
+                if (u.origin !== location.origin) return;
+                if (u.pathname === location.pathname && u.search === location.search && u.hash === location.hash) return;
+                location.href = u.href;
+              } catch (e) {}
+            }
+            function handleIntent(e) {
+              if (!e) return;
+              var k = window.NativeKit;
+              if (e.shortcut) sameOriginNavigate(e.shortcut);
+              if (e.url) { k.launch.url = e.url; emit('nativekit:deeplink', { url: e.url }); }
+              if (e.text) { k.launch.text = e.text; emit('nativekit:share', { text: e.text }); }
+            }
+
+            window.NativeKit = {
+              launch: {},
+              available: function () { return !!plugin(); },
+              info: function () { return call('info'); },
+              toast: function (t, isLong) { return call('toast', { text: String(t), longDuration: !!isLong }); },
+              share: function (o) { return call('share', o || {}); },
+              openUrl: function (u) { return call('openUrl', { url: String(u) }); },
+              saveFile: function (name, base64, mime) { return call('saveFile', { name: name, data: base64, mime: mime }); },
+              setBars: function (color, dark) {
+                var o = { color: color };
+                if (dark !== undefined) o.dark = !!dark;
+                return call('setBars', o);
+              },
+              keepAwake: function (on) { return call('keepAwake', { enabled: on !== false }); },
+              secure: function (on) { return call('secure', { enabled: on !== false }); },
+              brightness: function (v) { return call('setBrightness', { value: (v === undefined) ? -1 : v }); },
+              orientation: function (o) { return call('setOrientation', { orientation: o || 'any' }); },
+              immersive: function (on) { return call('setImmersive', { enabled: on !== false }); },
+              shortcuts: function (items) { return call('setShortcuts', { items: items || [] }); },
+              minimize: function () { return call('minimize'); },
+              exit: function () { return call('exit'); }
+            };
+
+            function init() {
+              applyTheme();
+              try {
+                new MutationObserver(applyTheme).observe(document.head, { subtree: true, childList: true, attributes: true, attributeFilter: ['content'] });
+              } catch (e) {}
+              var p = plugin();
+              if (p && typeof p.addListener === 'function') { try { p.addListener('appIntent', handleIntent); } catch (e5) {} }
+              call('getLaunch').then(function (r) { setTimeout(function () { handleIntent(r); }, 400); }).catch(noop);
+              loadShortcuts();
+              window.addEventListener('load', applyTheme);
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+            console.log('NativeKit : actif');
+          })();
+          JSEOF
+
+          cat > nk-setup.js << 'NODEEOF'
+          var fs = require('fs');
+          var appId = process.argv[2];
+          var html = process.argv[3] || '';
+          var manifest = process.argv[4];
+          var t = (html && fs.existsSync(html)) ? fs.readFileSync(html, 'utf8') : '';
+
+          var color = '';
+          var m1 = /name=["']theme-color["'][^>]*content=["'](#[0-9a-fA-F]{3,6})["']/i.exec(t);
+          var m2 = /content=["'](#[0-9a-fA-F]{3,6})["'][^>]*name=["']theme-color["']/i.exec(t);
+          color = m1 ? m1[1] : (m2 ? m2[1] : '');
+          if (color.length === 4) {
+            color = '#' + color[1] + color[1] + color[2] + color[2] + color[3] + color[3];
+          }
+          if (color.length !== 7) color = '';
+
+          var cp = 'capacitor.config.json';
+          if (color && fs.existsSync(cp)) {
+            var cfg = JSON.parse(fs.readFileSync(cp, 'utf8'));
+            cfg.backgroundColor = color;
+            cfg.android = cfg.android || {};
+            cfg.android.backgroundColor = color;
+            fs.writeFileSync(cp, JSON.stringify(cfg, null, 2), 'utf8');
+          }
+
+          var m = fs.readFileSync(manifest, 'utf8');
+          if (m.indexOf('windowSoftInputMode') === -1) {
+            m = m.replace('<activity', '<activity android:windowSoftInputMode="adjustResize"');
+          }
+          if (m.indexOf('android:scheme="' + appId + '"') === -1) {
+            var filters = '<intent-filter><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.DEFAULT" /><category android:name="android.intent.category.BROWSABLE" /><data android:scheme="' + appId + '" /></intent-filter>'
+              + '<intent-filter><action android:name="android.intent.action.SEND" /><category android:name="android.intent.category.DEFAULT" /><data android:mimeType="text/plain" /></intent-filter>';
+            var i = m.indexOf('</activity>');
+            if (i >= 0) m = m.slice(0, i) + filters + m.slice(i);
+          }
+          fs.writeFileSync(manifest, m, 'utf8');
+
+          if (html && t.indexOf('nativekit.js') === -1) {
+            var tag = '<script src="nativekit.js"><' + '/script>';
+            var hm = /<head[ >]/i.exec(t);
+            if (hm) {
+              var e = t.indexOf('>', hm.index);
+              t = t.slice(0, e + 1) + tag + t.slice(e + 1);
+            } else {
+              var b = t.lastIndexOf('</body>');
+              t = (b >= 0) ? t.slice(0, b) + tag + t.slice(b) : t + tag;
+            }
+            fs.writeFileSync(html, t, 'utf8');
+          }
+          NODEEOF
+
+          MAIN_HTML=$(cd www && find . -maxdepth 1 -name "*.html" | head -n 1)
+          if [ -n "$MAIN_HTML" ]; then
+            node nk-setup.js "com.mekeirish.remotecontrol" "www/$MAIN_HTML" "$MANIFEST"
+          else
+            node nk-setup.js "com.mekeirish.remotecontrol" "" "$MANIFEST"
+          fi
+          rm -f nk-setup.js
+
+          if ! grep -q "registerPlugin(NativeKitPlugin.class)" "$JAVA_DIR/MainActivity.java"; then echo "ERREUR : NativeKit non enregistre"; exit 1; fi
+          if [ ! -f "$JAVA_DIR/NativeKitPlugin.java" ] || [ ! -f www/nativekit.js ]; then echo "ERREUR : NativeKit non injecte"; exit 1; fi
+          npx cap sync android
+
+      - name: Génération icône
+        run: |
+          cd capacitor-app
+          npm install -D @capacitor/assets
+          mkdir -p assets
+          if [ -f "../icon.png" ]; then
+            cp ../icon.png assets/icon.png
+            npx @capacitor/assets generate --android
+          fi
+
+      - name: Versioning et Signature
+        run: |
+          cd capacitor-app/android/app
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/g" build.gradle
+          
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            cat >> build.gradle << EOF
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword "${{ secrets.KEYSTORE_PASSWORD }}"
+                      keyAlias "${{ secrets.KEY_ALIAS }}"
+                      keyPassword "${{ secrets.KEY_PASSWORD }}"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled false
+                  }
+              }
+          }
+          EOF
+          fi
+
+      - name: Résolution conflits Kotlin
+        run: |
+          echo "configurations.all { exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'; exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8' }" >> capacitor-app/android/app/build.gradle
+
+      - name: Compilation APK
+        run: |
+          cd capacitor-app/android
+          chmod +x gradlew
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      - name: Renommer APK
+        run: |
+          cd capacitor-app/android/app/build/outputs/apk/
+          if [ -d "release" ]; then
+            mv release/app-release.apk ../../../../../Remote-control.apk
+          else
+            mv debug/app-debug.apk ../../../../../Remote-control.apk
+          fi
+
+      - name: Publication en Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "capacitor-app/Remote-control.apk"
+          tag: "v${{ github.run_number }}"
+          name: "Remote-control v${{ github.run_number }}"
+          allowUpdates: false
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
